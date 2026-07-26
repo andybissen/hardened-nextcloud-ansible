@@ -1,0 +1,19 @@
+[Journal]
+# Persist logs to disk (survives reboots) rather than the default
+# volatile in-memory storage.
+Storage=persistent
+
+# Native time-based deletion - this is the piece Docker's own logging
+# drivers don't provide, which is why all containers now log via the
+# journald driver instead of json-file (see docker-compose.yml.j2).
+MaxRetentionSec={{ docker_log_retention_days }}days
+
+# Belt-and-suspenders size cap, so a runaway logging burst can't fill the
+# disk before the age-based retention above would otherwise catch it.
+SystemMaxUse={{ journald_system_max_use }}
+
+# Note: this retention policy is host-wide - it applies to everything in
+# the journal (SSH, systemd units, etc.), not just the containers in this
+# stack. For a single-purpose VPS that's a reasonable uniform policy, but
+# worth knowing if you ever add unrelated services to this host that want
+# a different retention window.

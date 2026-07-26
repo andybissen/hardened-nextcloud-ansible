@@ -1,0 +1,18 @@
+#!/bin/bash
+# Blocks external (non-Docker-bridge) traffic to Postgres's and Valkey's
+# ports at the DOCKER-USER chain, regardless of whether a "ports:" mapping
+# ever gets added to docker-compose.yml by accident. Docker never flushes
+# DOCKER-USER on its own, so this only needs to run again after a reboot
+# (when the chain's contents are wiped along with the rest of iptables'
+# in-memory state) - hence the systemd unit that calls this after
+# docker.service starts.
+set -euo pipefail
+
+IFACE="{{ ansible_facts['default_ipv4']['interface'] }}"
+PORTS=("5432" "6379")
+
+for PORT in "${PORTS[@]}"; do
+  if ! iptables -C DOCKER-USER -i "${IFACE}" -p tcp --dport "${PORT}" -j DROP 2>/dev/null; then
+    iptables -I DOCKER-USER -i "${IFACE}" -p tcp --dport "${PORT}" -j DROP
+  fi
+done

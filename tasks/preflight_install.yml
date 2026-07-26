@@ -1,0 +1,315 @@
+# Pre-flight validation for playbook.yml. Everything here is read-only and
+# fails BEFORE setup_host.yml touches the host, so a misconfigured all.yml/
+# vault.yml (or a host this deployment can't support) is caught up front
+# rather than partway through a deploy. Tagged `preflight` on the include in
+# playbook.yml, so `--tags preflight` runs just these checks as a dry-run
+# config validation without deploying anything.
+
+# --- Host is actually RHEL-family (there is no other-distro support; an
+# accidental run against Debian/Ubuntu would otherwise die confusingly once
+# it hit dnf/firewalld/SELinux in setup_host.yml) ---
+- name: Assert the host is RHEL-family
+  ansible.builtin.assert:
+    that:
+      - ansible_facts['os_family'] == 'RedHat'
+    fail_msg: >-
+      This deployment only supports RHEL-family hosts (Rocky/RHEL/Alma).
+      Detected os_family: {{ ansible_facts['os_family'] | default('unknown') }}.
+    success_msg: "Host is RHEL-family ({{ ansible_facts['distribution'] | default('?') }} {{ ansible_facts['distribution_version'] | default('?') }})."
+
+# --- Configured resource ceilings vs. what this host can actually deliver.
+# Every service already gets a hard mem_limit/cpus in docker-compose.yml.j2
+# (cgroups-enforced, confirmed live), so containers can't clobber each other
+# by default - but the *.example defaults were sized for a mid-range VPS. On
+# a smaller box the SUM of those ceilings can still exceed what the host
+# actually has, which reintroduces the same contention (CPU) or host-wide
+# OOM risk (RAM) the per-service limits are meant to prevent. Warning, not a
+# hard fail: some users may knowingly accept the tradeoff on a small box. ---
+- name: Sum the configured CPU allocations
+  ansible.builtin.set_fact:
+    preflight_total_cpus: "{{ [traefik_cpus, socket_proxy_cpus, postgres_cpus, nextcloud_cpus, valkey_cpus, nextcloud_cron_cpus] | map('float') | sum }}"
+
+- name: Assert the memory limits use a parseable Docker byte-value format
+  # Docker/compose accept a plain byte count or a b/k/m/g/kb/mb/gb suffix,
+  # any case - the same set the parser below handles. A value outside that
+  # (a typo like "2x") would break docker compose later anyway, so failing
+  # here with a clear message beats a KeyError mid-parse or compose's own
+  # less-obvious error at deploy time.
+  ansible.builtin.assert:
+    that:
+      - (item | string | trim | lower) is match('^[0-9.]+(b|kb?|mb?|gb?)?$')
+    fail_msg: >-
+      '{{ item }}' is not a parseable Docker memory value - use forms like
+      512m, 2g, 1536mb, or a plain byte count (see the *_memory_limit values
+      in all.yml).
+  loop:
+    - "{{ traefik_memory_limit }}"
+    - "{{ socket_proxy_memory_limit }}"
+    - "{{ postgres_memory_limit }}"
+    - "{{ nextcloud_memory_limit }}"
+    - "{{ valkey_memory_limit }}"
+    - "{{ nextcloud_cron_memory_limit }}"
+
+- name: Convert each configured memory limit to MB
+  # Splits the value into its numeric part (leading digits/dot) and unit
+  # part (whatever trails it, lowercased; empty = plain bytes), then
+  # converts to MB via the unit map. Starts from [] on the first iteration
+  # rather than appending to any previous value - set_fact facts persist
+  # for the host across plays in one ansible-playbook run, so a plain
+  # append would carry stale entries into a second run of this file (same
+  # pattern as backup.yml's container-state distill).
+  ansible.builtin.set_fact:
+    preflight_mem_mb_list: "{{ ([] if ansible_loop.first else preflight_mem_mb_list) + [(item_l | regex_replace('[a-z]+$', '') | float) * preflight_mem_unit_mb[item_l | regex_replace('^[0-9.]+', '')]] }}"
+  vars:
+    item_l: "{{ item | string | trim | lower }}"
+    preflight_mem_unit_mb: {"": 0.00000095367431640625, "b": 0.00000095367431640625, "k": 0.0009765625, "kb": 0.0009765625, "m": 1, "mb": 1, "g": 1024, "gb": 1024}
+  loop:
+    - "{{ traefik_memory_limit }}"
+    - "{{ socket_proxy_memory_limit }}"
+    - "{{ postgres_memory_limit }}"
+    - "{{ nextcloud_memory_limit }}"
+    - "{{ valkey_memory_limit }}"
+    - "{{ nextcloud_cron_memory_limit }}"
+  loop_control:
+    extended: true
+
+- name: Sum the configured memory allocations
+  ansible.builtin.set_fact:
+    preflight_total_mem_mb: "{{ preflight_mem_mb_list | sum }}"
+
+- name: Warn if configured resource limits exceed this host's actual capacity
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: configured service limits total ~{{ preflight_total_cpus }}
+      vCPU-equivalent and ~{{ preflight_total_mem_mb | round | int }}MB RAM,
+      but this host reports {{ ansible_facts['processor_vcpus'] }} vCPUs and
+      {{ ansible_facts['memtotal_mb'] }}MB RAM. Containers may compete for
+      real CPU under load, and/or the host could hit OOM under memory
+      pressure, if all services are busy at once. Consider lowering the
+      *_cpus / *_memory_limit values in all.yml for this host's size.
+  when: >-
+    (preflight_total_cpus | float) > (ansible_facts['processor_vcpus'] | float)
+    or (preflight_total_mem_mb | float) > (ansible_facts['memtotal_mb'] | float)
+
+# --- Site-specific placeholders were actually filled in. Exact-string
+# matches against the *.example defaults (not a fuzzy 'example.com'
+# substring), so someone who genuinely owns example.com isn't false-flagged.
+# Catches the classic "copied the example, forgot to edit it" failure, which
+# otherwise surfaces as a broken cert or an unreachable site rather than a
+# clear message. ---
+- name: Assert all.yml site-specific values are not still placeholders
+  ansible.builtin.assert:
+    that:
+      - hostname is defined and hostname != 'nc.example.com'
+      - acme_email is defined and acme_email != 'admin@example.com'
+      - gpg_recipient_key_id is defined and gpg_recipient_key_id != 'REPLACE_WITH_YOUR_KEY_ID_OR_EMAIL'
+    fail_msg: >-
+      One or more required values in group_vars/all.yml is still the
+      placeholder from all.yml.example. Set real values for hostname,
+      acme_email, and gpg_recipient_key_id before deploying.
+
+- name: Assert vault secrets are not still placeholders
+  ansible.builtin.assert:
+    that:
+      - vault_postgres_password is defined and vault_postgres_password != 'change-me-to-something-long-and-random'
+      - vault_nextcloud_admin_password is defined and vault_nextcloud_admin_password != 'change-me-too'
+      - vault_valkey_password is defined and vault_valkey_password != 'change-me-too-a-long-random-one'
+    fail_msg: >-
+      One or more secrets in group_vars/vault.yml is still the placeholder
+      from vault.yml.example. Set real values (and re-encrypt with
+      ansible-vault) before deploying.
+  no_log: true
+
+# The Valkey password has a real syntactic constraint (documented in
+# vault.yml.example): it must be alphanumeric, since a non-alphanumeric
+# character can break how it's carried into the valkey.conf requirepass line
+# and the shell healthcheck. Unlike the S3 credentials, this is OUR password
+# with OUR rule, so validating it can't false-reject a legitimate value -
+# and a purely-alphanumeric string is safe in every context it's used in.
+- name: Assert the Valkey password is alphanumeric
+  ansible.builtin.assert:
+    that:
+      - vault_valkey_password is match('^[A-Za-z0-9]+$')
+    fail_msg: >-
+      vault_valkey_password must be alphanumeric (A-Z, a-z, 0-9 only) - see
+      the note in vault.yml.example. A character like $ " \ or a space can
+      break the rendered config/healthcheck. Regenerate it without special
+      characters.
+  no_log: true
+
+# --- DNS. Traefik's ACME HTTP-01 challenge needs `hostname` to resolve to
+# this host, or cert issuance fails slowly and confusingly. Resolution-
+# missing is a hard failure (typo'd/absent record); a resolve that doesn't
+# include this host's primary IP is only a warning, since a proxy/CDN or a
+# floating/secondary IP can legitimately make them differ. ---
+- name: Check that the hostname resolves in DNS
+  ansible.builtin.command: "getent ahostsv4 {{ hostname }}"
+  register: preflight_dns
+  changed_when: false
+  failed_when: false
+
+- name: Assert the hostname resolves
+  ansible.builtin.assert:
+    that:
+      - preflight_dns.rc == 0
+    fail_msg: >-
+      {{ hostname }} does not resolve in DNS from this host. Point its A
+      record at this VPS before deploying - Traefik's Let's Encrypt challenge
+      will fail otherwise.
+
+- name: Warn if the hostname does not resolve to this host's primary IP
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: {{ hostname }} resolves, but not to this host's primary IP
+      ({{ ansible_facts['default_ipv4']['address'] }}). If this host is
+      reached directly (no proxy/CDN, no floating IP), Traefik's ACME
+      challenge will fail. Double-check the DNS record.
+  when:
+    - preflight_dns.rc == 0
+    - ansible_facts['default_ipv4']['address'] is defined
+    - ansible_facts['default_ipv4']['address'] not in preflight_dns.stdout
+
+# --- Backup encryption key. Not strictly needed for the very first install,
+# but the first upgrade (and any backup) will need it, so a missing key here
+# is worth a heads-up now rather than a surprise later. Warning, not a hard
+# failure, matching docs/install.md's stance. ---
+- name: Check the backup public key is present on the control machine
+  ansible.builtin.stat:
+    path: "{{ playbook_dir }}/files/backup_public_key.asc"
+  delegate_to: localhost
+  run_once: true
+  register: preflight_backup_key
+
+- name: Warn if the backup public key is missing
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: files/backup_public_key.asc is missing. It's not required for
+      this first install, but backups and upgrades will fail without it -
+      see docs/install.md ("Set up the backup encryption key").
+  when: not preflight_backup_key.stat.exists
+
+# --- Optional S3 primary storage: only when enabled. Placeholder checks,
+# SSE-C key format, and endpoint reachability. ---
+- name: Validate the optional S3 configuration
+  when: s3_bucket is defined and s3_bucket | length > 0
+  block:
+    - name: Assert S3 values are not still placeholders
+      ansible.builtin.assert:
+        that:
+          - s3_bucket != 'REPLACE_WITH_YOUR_BUCKET_NAME'
+          - s3_region is defined and s3_region != 'REPLACE_WITH_YOUR_BUCKET_REGION'
+          - s3_hostname is defined and s3_hostname != 'REPLACE_WITH_YOUR_S3_ENDPOINT'
+          - vault_s3_key_id is defined and vault_s3_key_id != 'change-me'
+          - vault_s3_secret_key is defined and vault_s3_secret_key != 'change-me'
+        fail_msg: >-
+          S3 storage is enabled (s3_bucket is set) but one or more S3 values
+          is still the placeholder from the *.example files. Fill in the
+          real bucket/region/endpoint and the vault_s3_* credentials.
+      no_log: true
+
+    # SSE-C keys are exactly 32 bytes; base64 of 32 bytes is a 44-char string
+    # (43 base64 chars + one '='). Checking the string format is reliable,
+    # unlike `b64decode | length`, which counts decoded *characters* not
+    # bytes and undercounts. A wrong-length key fails at runtime with an
+    # opaque S3 error, so catching it here is worth it.
+    - name: Assert the SSE-C key is a 32-byte base64 value
+      ansible.builtin.assert:
+        that:
+          - vault_s3_sse_c_key is defined
+          - vault_s3_sse_c_key is match('^[A-Za-z0-9+/]{43}=$')
+        fail_msg: >-
+          vault_s3_sse_c_key must be base64 of exactly 32 bytes (generate
+          with: openssl rand -base64 32). It doesn't match that format.
+      no_log: true
+
+    - name: Check the S3 endpoint is reachable
+      ansible.builtin.uri:
+        url: "https://{{ s3_hostname }}"
+        method: HEAD
+        # Any HTTP response means the endpoint is reachable and speaking
+        # TLS; an S3 endpoint answering a bare unauthenticated HEAD with
+        # 400/403/404 is expected and fine. Only a connect/timeout failure
+        # is interesting here.
+        status_code: [200, 400, 403, 404, 405, 501]
+        timeout: 10
+      register: preflight_s3
+      failed_when: false
+      changed_when: false
+
+    - name: Warn if the S3 endpoint did not respond
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: could not reach the S3 endpoint https://{{ s3_hostname }}
+          ({{ preflight_s3.msg | default('no response') }}). Nextcloud will
+          fail to start if this endpoint isn't reachable at deploy time.
+          (Credential/bucket correctness itself can't be checked here - only
+          reachability.)
+      when: preflight_s3.status is not defined or preflight_s3.status <= 0
+
+# --- Downgrade guard: if a container is already running (i.e. this is a
+# re-run, not a fresh install), refuse to re-render an all.yml that's pinned
+# BEHIND what's deployed - that would try to downgrade Nextcloud/Postgres,
+# which they refuse, leaving the stack unable to start. This is the "forgot
+# to bump all.yml after an upgrade" footgun. Skipped cleanly on a genuine
+# fresh install, where no container is running yet. ---
+- name: Get the deployed Nextcloud version (if any container is running)
+  community.docker.docker_container_exec:
+    container: nextcloud_app
+    command: php occ status --output=json
+  register: preflight_nc_deployed
+  changed_when: false
+  failed_when: false
+
+- name: Assert all.yml's Nextcloud pin is not behind the deployed major
+  ansible.builtin.assert:
+    that:
+      - (nextcloud_image.split(':')[1].split('-')[0] | int) >= (nc_deployed_major | int)
+    fail_msg: >-
+      group_vars/all.yml pins nextcloud_image to major
+      {{ nextcloud_image.split(':')[1].split('-')[0] }}, but the running
+      instance is already on major {{ nc_deployed_major }}. Re-running
+      playbook.yml would try to DOWNGRADE Nextcloud, which it refuses. Bump
+      nextcloud_image in all.yml to at least {{ nc_deployed_major }} (see
+      docs/nextcloud-upgrade.md - this is the "update all.yml after an
+      upgrade" step).
+  vars:
+    nc_deployed_major: "{{ (preflight_nc_deployed.stdout | from_json).version.split('.')[0] }}"
+  # rc is checked with `is defined` first: on a fresh install (container
+  # doesn't exist) docker_container_exec fails at the MODULE level and the
+  # registered result has no rc key at all - confirmed against a live host -
+  # so referencing .rc directly would error instead of skipping. The when
+  # list ANDs in order and short-circuits, so each condition guards the next.
+  when:
+    - preflight_nc_deployed.rc is defined
+    - preflight_nc_deployed.rc == 0
+    - (preflight_nc_deployed.stdout | default('{}', true) | from_json).version is defined
+
+- name: Get the deployed Postgres version (if any container is running)
+  community.docker.docker_container_exec:
+    container: pg_db
+    command: postgres --version
+  register: preflight_pg_deployed
+  changed_when: false
+  failed_when: false
+
+- name: Assert all.yml's Postgres pin is not behind the deployed major
+  ansible.builtin.assert:
+    that:
+      - (postgres_image.split(':')[1].split('-')[0] | int) >= (pg_deployed_major | int)
+    fail_msg: >-
+      group_vars/all.yml pins postgres_image to major
+      {{ postgres_image.split(':')[1].split('-')[0] }}, but the running
+      database is already on major {{ pg_deployed_major }}. Re-running
+      playbook.yml would render the old major and Postgres would refuse to
+      start on the newer data directory. Bump postgres_image in all.yml to
+      {{ pg_deployed_major }} (see docs/maintenance.md).
+  vars:
+    pg_deployed_major: "{{ preflight_pg_deployed.stdout | regex_search('PostgreSQL\\)\\s*([0-9]+)', '\\1') | first }}"
+  # Same fresh-install rc guard as the Nextcloud check above. The
+  # regex_search needs `is not none`: it returns a string/None, and a bare
+  # string in `when:` trips Ansible's strict must-be-boolean conditional
+  # check (the exact failure mode hit live with `when: s3_bucket` earlier).
+  when:
+    - preflight_pg_deployed.rc is defined
+    - preflight_pg_deployed.rc == 0
+    - (preflight_pg_deployed.stdout | default('') | regex_search('PostgreSQL')) is not none

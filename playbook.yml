@@ -1,0 +1,82 @@
+---
+- name: Deploy Nextcloud + Postgres + Traefik on RHEL Based Server
+  hosts: nextcloud_servers
+  become: false
+
+  vars_files:
+    - group_vars/vault.yml
+
+  handlers:
+    - name: Import shared handlers
+      ansible.builtin.import_tasks: handlers/main.yml
+
+  tasks:
+    # Fails before setup_host.yml touches anything if the config or host is
+    # unfit. Run just these with: ansible-playbook playbook.yml --tags preflight
+    # (a dry-run config check that deploys nothing).
+    - name: Pre-flight validation
+      ansible.builtin.include_tasks: tasks/preflight_install.yml
+      tags: [preflight]
+
+    - name: Set up the host (Docker, firewalld, DOCKER-USER, journald)
+      ansible.builtin.include_tasks: tasks/setup_host.yml
+
+    # --- Vulnerability scan (informational only) ---
+    # Skip with: ansible-playbook playbook.yml --ask-vault-pass --skip-tags scan
+    # Worth skipping for a config-only re-run (e.g. tweaking z-apache-hardening.conf)
+    # where no image tag changed - re-scanning all five images is the slowest
+    # part of the run and finds nothing new if nothing pulled a fresh image.
+    - name: Scan all stack images for known vulnerabilities
+      ansible.builtin.include_tasks: tasks/scan_images.yml
+      tags: [scan]
+      vars:
+        images_to_scan:
+          - "{{ traefik_image }}"
+          - "{{ postgres_image }}"
+          - "{{ nextcloud_image }}"
+          - "{{ valkey_image }}"
+          - "tecnativa/docker-socket-proxy:latest"
+
+    - name: Render docker-compose.yml and app config
+      ansible.builtin.include_tasks: tasks/render_config.yml
+
+    - name: Bring up the stack
+      community.docker.docker_compose_v2:
+        project_src: "{{ compose_dir }}"
+        state: present
+        pull: policy
+
+    # No admin UI toggle exists for this - occ/config.php is the only way
+    # to set it. Stored in config/config.php on the nc_data volume (not the
+    # database), so this only needs to run on a fresh install: a restored
+    # instance already carries it via the restored volume. Retries because
+    # the container being "up" doesn't mean Nextcloud's own first-boot
+    # install routine has finished yet - occ isn't usable until it has.
+    - name: Set the maintenance window start hour
+      community.docker.docker_container_exec:
+        container: nextcloud_app
+        command: >-
+          php occ config:system:set maintenance_window_start
+          --type=integer --value={{ nextcloud_maintenance_window_start }}
+      register: maintenance_window_result
+      until: maintenance_window_result.rc == 0
+      retries: 30
+      delay: 10
+
+    # Routes Nextcloud's own structured logger through PHP's error_log()
+    # instead of a growing, unrotated data/nextcloud.log on the nc_data
+    # volume - the image already points error_log at stderr, and every
+    # service here already logs via the journald driver (see
+    # docker-compose.yml.j2) with retention already handled by
+    # journald-retention.conf.j2, so this rides existing infrastructure
+    # rather than adding new plumbing. Same fresh-install-only reasoning as
+    # the maintenance-window task above: this lives in config.php on the
+    # nc_data volume, so a restored/migrated instance already carries it.
+    - name: Route Nextcloud's log output to journald instead of a file on nc_data
+      community.docker.docker_container_exec:
+        container: nextcloud_app
+        command: php occ config:system:set log_type --value=errorlog
+      register: log_type_result
+      until: log_type_result.rc == 0
+      retries: 30
+      delay: 10

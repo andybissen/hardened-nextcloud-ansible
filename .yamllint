@@ -1,0 +1,20 @@
+---
+# ansible-lint's own bundled default (not yamllint's plain `default` ruleset,
+# which would additionally flag things like missing `---` document-start
+# markers on every file) - copied here so line-length can be relaxed for the
+# one genuinely long, deliberately-dense line in tasks/preflight_install.yml
+# (the memory-unit-conversion set_fact - see the comment above it).
+extends: default
+rules:
+  comments:
+    min-spaces-from-content: 1
+  comments-indentation: false
+  document-start: disable
+  line-length:
+    max: 220
+  braces:
+    min-spaces-inside: 0
+    max-spaces-inside: 1
+  octal-values:
+    forbid-implicit-octal: true
+    forbid-explicit-octal: true

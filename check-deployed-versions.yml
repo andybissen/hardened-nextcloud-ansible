@@ -1,0 +1,60 @@
+---
+# Queries the ACTUALLY deployed version of each service straight from the
+# running containers - the complement to check-updates.py, which only ever
+# asks Docker Hub "what's the newest tag published under this pin" and has
+# no way on its own to know whether that's already running or sitting one
+# or more patches behind. Floating tags like "9-alpine" only update on an
+# explicit pull; Docker never re-pulls a tag on its own.
+#
+# Run directly for a quick human-readable report:
+#   ansible-playbook check-deployed-versions.yml
+# Or let `check-updates.py --live` invoke this itself and fold the results
+# into its own report (see that script).
+#
+# No vault vars needed - none of these commands touch secrets.
+#
+# Every task uses ignore_errors so one missing/unreachable container (mid
+# deploy, or a container name changed) doesn't stop the others from being
+# checked - each just reports "could not determine" instead.
+
+- name: Query deployed versions of each pinned service
+  hosts: nextcloud_servers
+  become: false
+  gather_facts: false
+
+  tasks:
+    - name: Check Traefik version
+      community.docker.docker_container_exec:
+        container: traefik
+        command: traefik version
+      register: traefik_version
+      ignore_errors: true
+
+    - name: Check Postgres version
+      community.docker.docker_container_exec:
+        container: pg_db
+        command: postgres --version
+      register: postgres_version
+      ignore_errors: true
+
+    - name: Check Valkey version
+      community.docker.docker_container_exec:
+        container: valkey
+        command: valkey-server --version
+      register: valkey_version
+      ignore_errors: true
+
+    - name: Check Nextcloud version
+      community.docker.docker_container_exec:
+        container: nextcloud_app
+        command: php occ status --output=json
+      register: nextcloud_version
+      ignore_errors: true
+
+    - name: Report deployed versions
+      ansible.builtin.debug:
+        msg:
+          - "Traefik:   {{ traefik_version.stdout | default('could not determine') }}"
+          - "Postgres:  {{ postgres_version.stdout | default('could not determine') }}"
+          - "Valkey:    {{ valkey_version.stdout | default('could not determine') }}"
+          - "Nextcloud: {{ nextcloud_version.stdout | default('could not determine') }}"

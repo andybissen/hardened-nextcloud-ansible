@@ -1,0 +1,19 @@
+---
+# Handlers for setup_host.yml - declared here so they can be shared by
+# any play that includes setup_host.yml (currently playbook.yml and
+# restore.yml). Handlers only fire once per play even if notified
+# multiple times, and only if the notifying task actually changed.
+
+- name: Restart docker
+  ansible.builtin.systemd:
+    name: docker
+    state: restarted
+
+- name: Reload systemd
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: Restart journald
+  ansible.builtin.systemd:
+    name: systemd-journald
+    state: restarted

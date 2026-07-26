@@ -1,0 +1,129 @@
+---
+# Task file (not a standalone playbook) - included by playbook.yml and
+# restore.yml so both stay in sync. Installs Docker CE, enables SELinux
+# container confinement, opens firewalld ports, installs the DOCKER-USER
+# Postgres backstop, and configures journald log retention.
+#
+# Requires vars from group_vars/all.yml (docker_log_retention_days,
+# journald_system_max_use) to already be in scope.
+#
+# Handlers: this file notifies three handlers that must be declared in
+# the play that includes it:
+#   - Restart docker
+#   - Reload systemd
+#   - Restart journald
+# Both playbook.yml and restore.yml declare these via handlers/main.yml.
+
+# --- Docker CE installation ---
+- name: Install dnf-plugins-core
+  ansible.builtin.dnf:
+    name: dnf-plugins-core
+    state: present
+
+- name: Add Docker CE repo
+  ansible.builtin.get_url:
+    url: https://download.docker.com/linux/rhel/docker-ce.repo
+    dest: /etc/yum.repos.d/docker-ce.repo
+    mode: "0644"
+
+- name: Install Docker CE and plugins
+  ansible.builtin.dnf:
+    name:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+      - docker-compose-plugin
+      - container-selinux
+    state: present
+
+# Required by community.docker modules (docker_container,
+# docker_container_exec) which use the Docker SDK for Python rather than
+# shelling out to the CLI the way docker_compose_v2 does.
+- name: Install python3-requests (required by community.docker SDK modules)
+  ansible.builtin.dnf:
+    name:
+      - python3-requests
+    state: present
+
+# Docker CE does NOT enable its own SELinux container confinement by
+# default, even on a host with SELinux enforcing - this has to be
+# turned on explicitly, or every container runs effectively unconfined
+# regardless of the host's SELinux state.
+- name: Ensure /etc/docker exists
+  ansible.builtin.file:
+    path: /etc/docker
+    state: directory
+    mode: "0755"
+
+- name: Configure Docker daemon SELinux support
+  ansible.builtin.copy:
+    content: |
+      {
+        "selinux-enabled": true
+      }
+    dest: /etc/docker/daemon.json
+    mode: "0644"
+  notify: Restart docker
+
+- name: Enable and start Docker
+  ansible.builtin.systemd:
+    name: docker
+    enabled: true
+    state: started
+
+# --- firewalld ---
+- name: Ensure firewalld is running
+  ansible.builtin.systemd:
+    name: firewalld
+    enabled: true
+    state: started
+
+- name: Open HTTP and HTTPS in firewalld
+  ansible.posix.firewalld:
+    service: "{{ item }}"
+    permanent: true
+    immediate: true
+    state: enabled
+  loop:
+    - http
+    - https
+
+# --- DOCKER-USER hardening ---
+# Belt-and-suspenders: blocks external access to Postgres's port at the
+# iptables layer regardless of what docker-compose.yml says, so an
+# accidental "ports:" mapping added later can't expose the database.
+# firewalld's own rules don't cover this - Docker's published-port
+# handling bypasses firewalld's normal filtering entirely, so this has
+# to live in the DOCKER-USER chain specifically.
+- name: Install the DOCKER-USER firewall script
+  ansible.builtin.template:
+    src: templates/docker-user-firewall.sh.j2
+    dest: /usr/local/bin/docker-user-firewall.sh
+    mode: "0750"
+
+- name: Install the DOCKER-USER firewall systemd unit
+  ansible.builtin.copy:
+    src: templates/docker-user-firewall.service
+    dest: /etc/systemd/system/docker-user-firewall.service
+    mode: "0644"
+  notify: Reload systemd
+
+- name: Enable and run the DOCKER-USER firewall service now
+  ansible.builtin.systemd:
+    name: docker-user-firewall
+    enabled: true
+    state: restarted
+
+# --- Log retention (journald) ---
+- name: Ensure the journald drop-in directory exists
+  ansible.builtin.file:
+    path: /etc/systemd/journald.conf.d
+    state: directory
+    mode: "0755"
+
+- name: Render the journald retention drop-in
+  ansible.builtin.template:
+    src: templates/journald-retention.conf.j2
+    dest: /etc/systemd/journald.conf.d/10-retention.conf
+    mode: "0644"
+  notify: Restart journald

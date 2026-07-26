@@ -1,0 +1,390 @@
+---
+# Restore a backup produced by backup.yml onto a (typically brand-new)
+# VPS - e.g. after the original VPS was destroyed or you're moving to a
+# different provider.
+#
+# Usage:
+#   ansible-playbook restore.yml --ask-vault-pass \
+#     -e restore_backup_file=./backups/nextcloud-backup-20260101-120000.tar.zst.gpg
+#
+# One-time prerequisites on the CONTROL machine (not the VPS):
+#   - gnupg2, zstd, and rsync installed (rsync on the VPS is handled
+#     automatically by the playbook)
+#   - The GPG *private* key matching files/backup_public_key.asc imported
+#     into your local keyring (gpg --import <private-key-file>), so the
+#     backup can be decrypted here.
+#
+# Before running this:
+#   1. Point DNS (the `hostname` var) at the new VPS's IP - Traefik's ACME
+#      HTTP challenge needs this to already resolve correctly.
+#   2. Update inventory.ini to point at the new VPS.
+#   3. Make sure group_vars/vault.yml matches the values used when the
+#      backup was taken (same Postgres password, same B2/SSE-C keys - the
+#      SSE-C key in particular: if it doesn't match what was used to
+#      encrypt objects in B2, that data is unreadable, restore or no
+#      restore).
+#
+# Decryption happens entirely on the control machine - the GPG private key
+# never touches the VPS. The decrypted-but-still-compressed bundle is copied
+# up and extracted on the VPS (which keeps the transfer small - the
+# compressed bundle rather than the expanded, multi-GB tars); the extracted
+# plaintext is deleted from the VPS again once the restore completes.
+#
+# Ordering matters here: the official Nextcloud image auto-installs a
+# brand-new instance on first boot if it doesn't find an existing
+# version.php in /var/www/html. To avoid racing that, this brings up only
+# Postgres first, restores the DB dump and nc_data/traefik_certs volumes
+# while Nextcloud is still stopped, and only then starts nextcloud/cron.
+
+- name: Restore Nextcloud stack from an encrypted backup
+  hosts: nextcloud_servers
+  become: false
+
+  vars_files:
+    - group_vars/vault.yml
+
+  handlers:
+    - name: Import shared handlers
+      ansible.builtin.import_tasks: handlers/main.yml
+
+  tasks:
+    - name: Fail fast if no backup file was given
+      ansible.builtin.fail:
+        msg: "Pass the backup to restore: -e restore_backup_file=./backups/nextcloud-backup-<timestamp>.tar.zst.gpg"
+      when: restore_backup_file is not defined
+
+    - name: Confirm this destructive restore
+      ansible.builtin.pause:
+        prompt: >-
+          This will restore Postgres and Nextcloud data onto
+          {{ inventory_hostname }}, overwriting anything already deployed
+          there. Press ENTER to continue, or Ctrl+C then A to abort.
+      when: not (restore_confirm | default(false) | bool)
+
+    - name: Compute a restore timestamp
+      ansible.builtin.set_fact:
+        restore_timestamp: "{{ lookup('pipe', 'date +%Y%m%d-%H%M%S') }}"
+
+    # --- Decrypt and verify the backup locally (control machine only). It is
+    # NOT extracted here - the compressed bundle is shipped up and expanded on
+    # the VPS, so only the small compressed artifact crosses the wire. ---
+
+    - name: Verify the backup file exists locally
+      ansible.builtin.stat:
+        path: "{{ restore_backup_file }}"
+      delegate_to: localhost
+      run_once: true
+      register: restore_backup_stat
+
+    - name: Fail if the backup file was not found
+      ansible.builtin.fail:
+        msg: "{{ restore_backup_file }} does not exist on the control machine"
+      when: not restore_backup_stat.stat.exists
+
+    # --- Pre-flight: control-machine tooling, vault sanity, and target host
+    # fitness, before we decrypt anything or touch the target. Tagged
+    # preflight so `--tags preflight -e restore_backup_file=...` validates a
+    # restore's prerequisites without performing it. ---
+    - name: Assert decrypt/unpack/transfer tooling is present on the control machine
+      ansible.builtin.command: "{{ item }} --version"
+      register: restore_tooling
+      changed_when: false
+      failed_when: restore_tooling.rc != 0
+      delegate_to: localhost
+      run_once: true
+      loop:
+        - gpg
+        - zstd
+        - rsync
+      tags: [preflight]
+
+    - name: Assert core vault secrets are present (a restore needs them)
+      ansible.builtin.assert:
+        that:
+          - vault_postgres_password is defined and vault_postgres_password != 'change-me-to-something-long-and-random'
+          - vault_valkey_password is defined and vault_valkey_password != 'change-me-too-a-long-random-one'
+        fail_msg: >-
+          vault.yml is missing core secrets or still has placeholders. A
+          restore needs the SAME secrets used when the backup was taken -
+          especially the Postgres password and, for S3, the SSE-C key (or
+          the restored files are unreadable). See docs/restore.md.
+      no_log: true
+      tags: [preflight]
+
+    - name: Assert the restore target is RHEL-family
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['os_family'] == 'RedHat'
+        fail_msg: >-
+          Restore target must be a RHEL-family host (Rocky/RHEL/Alma).
+          Detected: {{ ansible_facts['os_family'] | default('unknown') }}.
+      tags: [preflight]
+
+    - name: Create a local staging directory for the decrypted backup
+      ansible.builtin.file:
+        path: "/tmp/nextcloud-restore-{{ restore_timestamp }}"
+        state: directory
+        mode: "0700"
+      delegate_to: localhost
+      run_once: true
+      register: local_restore_staging
+
+    - name: Decrypt the backup bundle
+      ansible.builtin.command: >
+        gpg --batch --yes
+        --output {{ local_restore_staging.path }}/bundle.tar.zst
+        --decrypt {{ restore_backup_file }}
+      delegate_to: localhost
+      run_once: true
+      changed_when: true
+
+    - name: Stat the decrypted bundle
+      ansible.builtin.stat:
+        path: "{{ local_restore_staging.path }}/bundle.tar.zst"
+      delegate_to: localhost
+      run_once: true
+      register: restore_bundle_stat
+
+    # --- Verify the bundle BEFORE touching the target host, so a
+    # corrupt/incomplete backup fails here rather than partway through a
+    # restore that's already reconfigured the host. We verify by LISTING, not
+    # extracting: tar --zstd -tvf decompresses the whole zstd stream (its
+    # frame checksum catches corruption) and prints each member with its
+    # uncompressed size. backup.yml already verified each inner tar with
+    # `tar -tf` before bundling, and the zstd checksum guarantees the bytes
+    # survived, so a bundle that lists cleanly has intact inner tars - no need
+    # to expand ~GB of tars onto the control machine just to check. ---
+    - name: Verify and list the decrypted bundle without extracting it
+      ansible.builtin.command: >
+        tar --zstd -tvf {{ local_restore_staging.path }}/bundle.tar.zst
+      delegate_to: localhost
+      run_once: true
+      changed_when: false
+      register: restore_bundle_listing
+
+    - name: Map each expected member to its uncompressed size from the listing
+      # GNU tar -tvf columns: perms owner/group SIZE date time NAME. Match on
+      # the basename of the last field (bundle names look like ./nc_data.tar)
+      # and read the size (3rd field). The >= 6 guard skips the bundle's own
+      # directory entry and any short/blank lines.
+      ansible.builtin.set_fact:
+        restore_member_sizes: >-
+          {{ restore_member_sizes | default({}) | combine({
+               (item.split()[-1] | basename): (item.split()[2] | int)
+             }) }}
+      delegate_to: localhost
+      run_once: true
+      loop: "{{ restore_bundle_listing.stdout_lines }}"
+      loop_control:
+        label: "{{ item.split()[-1] | default('') }}"
+      when:
+        - item.split() | length >= 6
+        - (item.split()[-1] | basename) in ['nextcloud-db.sql', 'nc_data.tar', 'traefik_certs.tar']
+
+    - name: Assert every expected member is present and non-trivial in the bundle
+      ansible.builtin.assert:
+        that:
+          - item in (restore_member_sizes | default({}))
+          - (restore_member_sizes | default({}))[item] | default(0) > 1024
+        fail_msg: >-
+          The backup bundle is missing or has a truncated {{ item }} - it may
+          be corrupt or incomplete. Refusing to restore from it; try an
+          earlier archive.
+        success_msg: "{{ item }} present in bundle ({{ (restore_member_sizes | default({}))[item] | default(0) }} bytes)."
+      delegate_to: localhost
+      run_once: true
+      loop:
+        - nextcloud-db.sql
+        - nc_data.tar
+        - traefik_certs.tar
+
+    - name: Measure free space on the restore target
+      # df '/' rather than remote_backup_dir: on a fresh restore target that
+      # directory doesn't exist yet, and everything is on the root filesystem
+      # on a single-disk VPS anyway.
+      ansible.builtin.command: "df -B1 --output=avail /"
+      register: restore_target_avail
+      changed_when: false
+
+    - name: Assert the target has room for the restored data
+      # Peak on the target: the compressed bundle lands and is extracted into
+      # the uncompressed tars (bundle + tars coexist briefly), then nc_data.tar
+      # is extracted into its volume (tars + volume coexist). Require the
+      # bundle plus ~2x the uncompressed total to cover both peaks with margin.
+      ansible.builtin.assert:
+        that:
+          - (restore_target_avail.stdout_lines[1] | int) > ((restore_bundle_stat.stat.size | int) + (restore_member_sizes.values() | sum) * 2)
+        fail_msg: >-
+          Not enough free space on the restore target for the
+          ~{{ ((restore_member_sizes.values() | sum) / 1048576) | round | int }}MB
+          of backup data plus the
+          {{ (restore_bundle_stat.stat.size / 1048576) | round | int }}MB
+          bundle (needs roughly the bundle + 2x the uncompressed data for the
+          extracted tars and volumes).
+
+    # --- Prepare the target host (idempotent - safe even if it's the
+    # original VPS being repaired rather than a genuinely new one) ---
+
+    - name: Set up the host (Docker, firewalld, DOCKER-USER, journald)
+      ansible.builtin.include_tasks: tasks/setup_host.yml
+
+    - name: Render docker-compose.yml and app config
+      ansible.builtin.include_tasks: tasks/render_config.yml
+
+    # --- Bring up only Postgres, and restore into it, before Nextcloud
+    # ever gets a chance to see an empty database and auto-install ---
+
+    - name: Bring up Postgres only, and wait for it to be healthy
+      community.docker.docker_compose_v2:
+        project_src: "{{ compose_dir }}"
+        state: present
+        pull: policy
+        services:
+          - postgres
+        wait: true
+        wait_timeout: 120
+
+    - name: Create a remote staging directory for the restore
+      ansible.builtin.file:
+        path: "{{ remote_backup_dir }}/restore-staging-{{ restore_timestamp }}"
+        state: directory
+        mode: "0750"
+      register: remote_restore_staging_dir
+
+    - name: Ensure rsync and zstd are present on the restore target
+      # rsync: synchronize (below) needs it on BOTH ends. zstd: the bundle is
+      # now extracted ON the VPS (tar --zstd shells out to zstd) instead of on
+      # the control machine. A fresh RHEL VPS may ship neither.
+      ansible.builtin.dnf:
+        name:
+          - rsync
+          - zstd
+        state: present
+
+    - name: Report the bundle about to be transferred to the VPS
+      # Ansible shows a task's output only when it finishes, so there's no
+      # live progress bar mid-transfer. Stating the size up front means a
+      # large transfer sitting on the next task reads as working, not stalled.
+      ansible.builtin.debug:
+        msg: >-
+          Transferring the
+          {{ (restore_bundle_stat.stat.size / 1048576) | round | int }}MB
+          compressed backup bundle to the VPS, then extracting it there.
+
+    - name: Transfer the compressed backup bundle to the VPS
+      # Push the still-compressed .tar.zst as-is and extract on the VPS,
+      # rather than expanding it locally and shipping the (much larger)
+      # uncompressed tars. compress: false is deliberate: the bundle is
+      # already zstd-compressed, so rsync -z would burn CPU for no gain (the
+      # opposite of the old approach, which shipped uncompressed tars where
+      # compression helped). --chmod keeps this plaintext bundle at 0600 on
+      # the target; --info=progress2 gives a transfer summary in the result.
+      ansible.posix.synchronize:
+        src: "{{ local_restore_staging.path }}/bundle.tar.zst"
+        dest: "{{ remote_restore_staging_dir.path }}/bundle.tar.zst"
+        mode: push
+        compress: false
+        rsync_opts:
+          - "--info=progress2"
+          - "--chmod=F600"
+
+    - name: Extract the bundle into the restore staging directory on the VPS
+      ansible.builtin.command: >
+        tar --zstd -xf {{ remote_restore_staging_dir.path }}/bundle.tar.zst
+        -C {{ remote_restore_staging_dir.path }}
+      changed_when: true
+
+    - name: Remove the bundle now that it's extracted (reclaim staging space)
+      # The three extracted members (DB dump + volume tars) remain in staging
+      # for the restore steps below; only the now-redundant bundle goes.
+      ansible.builtin.file:
+        path: "{{ remote_restore_staging_dir.path }}/bundle.tar.zst"
+        state: absent
+
+    - name: Restore the Postgres dump
+      # The password comes from the secret file already mounted in the
+      # container, so it never appears in the command line or Ansible logs.
+      ansible.builtin.shell: >
+        docker exec -i pg_db sh -c
+        'PGPASSWORD="$(cat /run/secrets/postgres_password)" psql -U nextcloud -d nextcloud'
+        < {{ remote_restore_staging_dir.path }}/nextcloud-db.sql
+      changed_when: true
+
+    - name: Restore the Nextcloud data volume (files + config.php)
+      community.docker.docker_container:
+        name: "nc_data_restore_helper_{{ restore_timestamp }}"
+        image: alpine:latest
+        command: "tar xf /backup/restore-staging-{{ restore_timestamp }}/nc_data.tar -C /dest"
+        memory: "256m"
+        cpus: "1.0"
+        volumes:
+          - "nc_data:/dest"
+          - "{{ remote_backup_dir }}:/backup:ro,z"
+        auto_remove: true
+        detach: false
+        state: started
+
+    - name: Restore the Traefik certs volume (optional - skip if you'd rather re-issue certs)
+      community.docker.docker_container:
+        name: "traefik_certs_restore_helper_{{ restore_timestamp }}"
+        image: alpine:latest
+        command: "tar xf /backup/restore-staging-{{ restore_timestamp }}/traefik_certs.tar -C /dest"
+        memory: "256m"
+        cpus: "1.0"
+        volumes:
+          - "traefik_certs:/dest"
+          - "{{ remote_backup_dir }}:/backup:ro,z"
+        auto_remove: true
+        detach: false
+        state: started
+
+    - name: Remove the remote restore-staging directory (plaintext DB dump + tarballs)
+      ansible.builtin.file:
+        path: "{{ remote_restore_staging_dir.path }}"
+        state: absent
+
+    # --- Now that the DB and volumes hold restored data, it's safe to
+    # start Nextcloud - it will see an existing version.php and take the
+    # upgrade-check path instead of a fresh install ---
+
+    - name: Bring up the full stack
+      community.docker.docker_compose_v2:
+        project_src: "{{ compose_dir }}"
+        state: present
+        pull: policy
+
+    - name: Wait for Nextcloud to report installed
+      community.docker.docker_container_exec:
+        container: nextcloud_app
+        command: php occ status
+      register: occ_status
+      until: |
+        occ_status.rc == 0 and 'installed: true' in occ_status.stdout
+      retries: 30
+      delay: 10
+
+    # backup.yml takes the nc_data snapshot while Nextcloud is in
+    # maintenance mode (for a consistent DB + files pair) and only turns it
+    # back off on the LIVE instance afterward, in its own always block - the
+    # archived config.php inside nc_data.tar still has maintenance mode on
+    # baked in. Every restore needs this explicit off switch, or the site
+    # comes back up stuck in maintenance mode despite installed: true.
+    - name: Take Nextcloud out of maintenance mode
+      community.docker.docker_container_exec:
+        container: nextcloud_app
+        command: php occ maintenance:mode --off
+
+    - name: Show the resulting Nextcloud status
+      ansible.builtin.debug:
+        var: occ_status.stdout_lines
+
+    - name: Clean up the local decrypted staging directory
+      ansible.builtin.file:
+        path: "{{ local_restore_staging.path }}"
+        state: absent
+      delegate_to: localhost
+      run_once: true
+
+    - name: Report restore complete
+      ansible.builtin.debug:
+        msg: "Restore complete from {{ restore_backup_file }}."

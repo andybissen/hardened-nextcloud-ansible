@@ -1,0 +1,193 @@
+---
+# Usage:
+#   ansible-playbook nextcloud-upgrade.yml --ask-vault-pass -e nextcloud_target_tag=34-apache
+#
+# Only ever bump ONE major version at a time (e.g. 33-apache -> 34-apache).
+# Nextcloud will refuse to upgrade across more than one major version in a
+# single jump - if you're several versions behind, run this once per version.
+
+# --- Pre-flight, BEFORE the backup import: fail fast on a bad invocation or
+# an unsupported version jump so we don't waste a full backup discovering it.
+# Bypass the version guard (not the tag/registry checks) with
+# -e skip_version_guard=true if you genuinely need to. ---
+- name: Pre-flight checks before upgrading Nextcloud
+  hosts: nextcloud_servers
+  become: false
+  gather_facts: false
+  tags: [preflight]
+
+  tasks:
+    - name: Fail fast if no target tag was given
+      ansible.builtin.fail:
+        msg: "Pass the target tag: -e nextcloud_target_tag=34-apache"
+      when: nextcloud_target_tag is not defined
+
+    - name: Confirm the target Nextcloud tag exists in the registry
+      # Docker Hub returns 404 for a tag that doesn't exist; catching a typo'd
+      # tag here beats discovering it when the pull/recreate fails mid-upgrade
+      # (after the backup has already run).
+      ansible.builtin.uri:
+        url: "https://hub.docker.com/v2/repositories/library/nextcloud/tags/{{ nextcloud_target_tag }}"
+        method: GET
+        status_code: [200]
+      register: nc_tag_exists
+      failed_when: nc_tag_exists.status != 200
+
+    - name: Read the currently deployed Nextcloud version
+      community.docker.docker_container_exec:
+        container: nextcloud_app
+        command: php occ status --output=json
+      register: nc_current
+      changed_when: false
+      failed_when: false
+
+    - name: Refuse to guess when the running instance can't be reached
+      # rc | default(1): when the container doesn't exist at all, the exec
+      # fails at the module level and the result carries NO rc key
+      # (confirmed live), so a bare .rc reference would error instead of
+      # firing this guard.
+      ansible.builtin.fail:
+        msg: >-
+          Could not read the deployed Nextcloud version from nextcloud_app
+          (rc={{ nc_current.rc | default('unavailable') }}). The skip-a-major
+          guard can't run without it - make sure the instance is up first, or
+          bypass with -e skip_version_guard=true if you're certain the jump
+          is valid.
+      when:
+        - not (skip_version_guard | default(false) | bool)
+        - (nc_current.rc | default(1)) != 0 or (nc_current.stdout | default('{}', true) | from_json).version is not defined
+
+    - name: Assert the jump is at most one major, and never a downgrade
+      ansible.builtin.assert:
+        that:
+          - (target_major | int) == (deployed_major | int) or (target_major | int) == ((deployed_major | int) + 1)
+        fail_msg: >-
+          Refusing to move Nextcloud from major {{ deployed_major }} to
+          {{ target_major }}. Only ONE major per jump is supported, and never
+          a downgrade - go one at a time
+          ({{ deployed_major }} -> {{ (deployed_major | int) + 1 }} -> ...).
+          Bypass with -e skip_version_guard=true if you're certain.
+        success_msg: "Version jump {{ deployed_major }} -> {{ target_major }} is valid."
+      vars:
+        deployed_major: "{{ (nc_current.stdout | from_json).version.split('.')[0] }}"
+        target_major: "{{ nextcloud_target_tag.split('-')[0] }}"
+      when: not (skip_version_guard | default(false) | bool)
+
+- name: Backup before upgrading
+  ansible.builtin.import_playbook: backup.yml
+
+- name: Upgrade Nextcloud to a new version
+  hosts: nextcloud_servers
+  become: false
+
+  vars_files:
+    - group_vars/vault.yml
+
+  tasks:
+    # Skip with: --skip-tags scan (see playbook.yml for the same option)
+    - name: Scan the target image for known vulnerabilities
+      ansible.builtin.include_tasks: tasks/scan_images.yml
+      tags: [scan]
+      vars:
+        images_to_scan:
+          - "nextcloud:{{ nextcloud_target_tag }}"
+
+    - name: Render docker-compose.yml with the new Nextcloud image tag
+      ansible.builtin.template:
+        src: templates/docker-compose.yml.j2
+        dest: "{{ compose_dir }}/docker-compose.yml"
+        mode: "0640"
+      vars:
+        nextcloud_image: "nextcloud:{{ nextcloud_target_tag }}"
+
+    - name: Pull the new image and recreate the Nextcloud container
+      community.docker.docker_compose_v2:
+        project_src: "{{ compose_dir }}"
+        state: present
+        pull: always
+        services:
+          - nextcloud
+          - cron
+
+    - name: Wait for the automatic upgrade routine to finish
+      # installed: true is NOT a signal that any upgrade has completed - it
+      # just means Nextcloud finished initial setup at SOME point in its
+      # history, which was already true before this upgrade even started.
+      # occ status kept reporting it immediately, so this check was
+      # satisfied almost instantly while `occ upgrade` was still actively
+      # running in the background - exactly what was observed via htop.
+      # needsDbUpgrade is the field that actually reflects this: it stays
+      # true for as long as the database migration is still running, and
+      # only flips to false once that's genuinely done. Retry budget is
+      # generous (up to 15 minutes) since a real, non-trivial database can
+      # take a lot longer to migrate than this test instance did.
+      community.docker.docker_container_exec:
+        container: nextcloud_app
+        command: php occ status --output=json
+      register: occ_status
+      until: |
+        occ_status.rc == 0 and
+        (occ_status.stdout | from_json).installed and
+        not (occ_status.stdout | from_json).needsDbUpgrade
+      retries: 60
+      delay: 15
+
+    - name: Show the resulting Nextcloud status
+      ansible.builtin.debug:
+        var: occ_status.stdout_lines
+
+    # Nextcloud deliberately does NOT run these two during `occ upgrade`
+    # itself - both can be slow on large instances, so they're left for the
+    # admin to run afterward rather than blocking the upgrade on them. Both
+    # are idempotent (no-op if there's nothing to do), so safe to run on
+    # every upgrade regardless of whether this particular one needs them.
+    - name: Run expensive repairs (mimetype migrations, etc.)
+      community.docker.docker_container_exec:
+        container: nextcloud_app
+        command: php occ maintenance:repair --include-expensive
+
+    - name: Add any missing database indices
+      community.docker.docker_container_exec:
+        container: nextcloud_app
+        command: php occ db:add-missing-indices
+
+    # Major upgrades schedule some migrations as background jobs rather
+    # than running them synchronously inside `occ upgrade` - per Nextcloud's
+    # own docs, these must be allowed to run (via cron.php, 2-3 passes)
+    # before starting another major upgrade. The cron sidecar already does
+    # this every 5 minutes on its own, but triggering it here directly means
+    # the playbook doesn't report done while migrations are still only
+    # queued, not yet processed.
+    - name: Run background jobs a few times to flush post-upgrade migrations
+      community.docker.docker_container_exec:
+        container: nextcloud_app
+        command: php cron.php
+      loop: "{{ range(1, 4) | list }}"
+      loop_control:
+        label: "pass {{ item }}"
+
+    - name: Remove the old Nextcloud image if this was a major version bump
+      # For a major bump (target tag names a DIFFERENT major), the old and
+      # new images are two independently-tagged images - the old one never
+      # becomes "dangling" just because this compose file stopped
+      # referencing it (dangling specifically means NO tag at all,
+      # <none>:<none>), so the dangling-only prune below silently does
+      # nothing for this case. Skipped entirely for a same-tag PATCH
+      # refresh (see docs/nextcloud-upgrade.md), where there's nothing to
+      # remove by name since the old and new strings are identical - that
+      # case IS genuinely dangling instead, which is what the prune task
+      # below is for. Safe to run even if it's already gone (returns an
+      # empty result rather than failing).
+      community.docker.docker_image_remove:
+        name: "{{ nextcloud_image }}"
+      when: nextcloud_image != ('nextcloud:' + nextcloud_target_tag)
+
+    - name: Prune the now-dangling previous Nextcloud image
+      # Catches the OTHER case: a same-tag patch refresh (pull: always
+      # re-fetching a fresher nextcloud:33-apache, say) leaves the old
+      # underlying image genuinely dangling, unlike the major-bump case
+      # the task above handles.
+      community.docker.docker_prune:
+        images: true
+        images_filters:
+          dangling: true

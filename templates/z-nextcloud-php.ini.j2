@@ -1,0 +1,38 @@
+; Custom PHP tuning for Nextcloud - dropped into /usr/local/etc/php/conf.d/
+; as z-nextcloud-custom.ini. The z- prefix matters: conf.d files load
+; alphabetically and the image ships its own nextcloud.ini and
+; opcache-recommended.ini in the same directory, so anything here has to
+; sort after those to actually take effect (digits sort before letters, so
+; the previous 99- prefix silently LOST to both image files). Same
+; load-order trick, and same naming convention (source filename matches
+; destination filename), as the z-nextcloud-apache-*.conf files.
+;
+; Division of labor: memory_limit, upload_max_filesize/post_max_size, and
+; opcache.memory_consumption are deliberately NOT set here - the image
+; manages those itself via its documented PHP_MEMORY_LIMIT /
+; PHP_UPLOAD_LIMIT / PHP_OPCACHE_MEMORY_CONSUMPTION env vars (interpolated
+; into its own ini files), which docker-compose.yml.j2 sets. The image also
+; already ships sane opcache defaults (interned_strings_buffer=32,
+; max_accelerated_files=10000, save_comments, revalidate_freq) and JIT
+; (opcache.jit=1255, jit_buffer_size=8M), so this file only carries what
+; the image does NOT manage.
+
+; --- Reduce version fingerprinting ---
+; Drops the X-Powered-By: PHP/x.y.z response header entirely, rather than
+; handing scanners/attackers a free, precise PHP version to target.
+expose_php = Off
+
+; --- Large file upload/download support ---
+; The size limits themselves come from PHP_UPLOAD_LIMIT (see above); these
+; are the time/buffering companions the image has no env var for.
+max_execution_time = 3600
+max_input_time = 3600
+; Nextcloud requires this off, or it errors with memory-related issues on
+; large responses (downloads/previews of big files).
+output_buffering = Off
+
+; --- Opcache for CLI ---
+; The image's opcache-recommended.ini covers the web SAPI but doesn't
+; enable opcache for CLI - the cron sidecar runs cron.php via CLI every
+; 5 minutes, so background jobs benefit from the same bytecode cache + JIT.
+opcache.enable_cli = 1

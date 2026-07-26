@@ -1,0 +1,19 @@
+---
+# Run locally with:
+#   ANSIBLE_VAULT_PASSWORD_FILE=~/.nc-vault-pass ansible-lint .
+# (reuses the same vault password file set up for scheduled backups - see
+# docs/backup.md#scheduling). Without a vault password available, the five
+# playbooks that load group_vars/vault.yml (backup.yml, restore.yml,
+# playbook.yml, nextcloud-upgrade.yml, pg-major-upgrade.yml) fail their
+# syntax-check step with a decrypt error instead of actually being linted.
+#
+# No CI wired up for this deliberately - see AGENTS.md.
+#
+# profile is deliberately `min`, not a stricter tier. The repo is clean at
+# min, but `basic` and above flag ~6 command-instead-of-module findings for
+# the streamed tar/rsync tasks (deliberate - the modules can't stream/behave
+# the way those tasks need; each has a comment explaining why). Bumping the
+# profile would just mean scattering `# noqa: command-instead-of-module`
+# across intentional design decisions. Don't raise it without accounting for
+# that.
+profile: min

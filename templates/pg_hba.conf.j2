@@ -1,0 +1,19 @@
+# TYPE  DATABASE        USER            ADDRESS                 METHOD
+
+# Unix-socket connections - used by pg_dump during backups, which runs via
+# "docker exec" inside this same container (see backup.yml).
+local   all             all                                     scram-sha-256
+
+# Loopback, in case anything ever connects via localhost TCP from inside
+# the container itself.
+host    all             all             127.0.0.1/32            scram-sha-256
+host    all             all             ::1/128                 scram-sha-256
+
+# Only Nextcloud, on the internal db_net network, may connect over TCP.
+# Network segmentation (db_net being internal-only) already limits who can
+# reach this port at all - this is the second, Postgres-native layer that
+# holds even if that network boundary were ever misconfigured.
+host    all             all             {{ db_network_subnet }} scram-sha-256
+
+# Everything else is implicitly rejected - pg_hba.conf has no catch-all
+# "trust"/"0.0.0.0/0" line the way the image's stock config does.

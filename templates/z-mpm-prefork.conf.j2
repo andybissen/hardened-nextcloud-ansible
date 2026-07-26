@@ -1,0 +1,32 @@
+# Overrides the image's own mods-enabled/mpm_prefork.conf entirely (same
+# exact-path-replacement trick as z-deflate-disabled.conf, not the
+# loads-after-alphabetically trick the z-nextcloud-*.conf files use - MPM
+# config lives in mods-enabled under its own fixed filename, not somewhere
+# ordering would help).
+#
+# The image's default MaxRequestWorkers (150) can exceed postgres_max_connections
+# (currently {{ postgres_max_connections }}) under a big enough burst of
+# concurrent requests - e.g. opening the Photos view against a library with
+# no cached previews yet fires off many simultaneous preview-generation
+# requests, each holding its own Postgres connection for the duration.
+# Enough of them at once and Postgres starts rejecting new connections with
+# "sorry, too many clients already" - confirmed live on this deployment.
+# Capped well under postgres_max_connections here, leaving headroom for the
+# cron sidecar and manual occ/admin sessions. Also just more appropriately
+# sized for the actual CPU budget (nextcloud_cpus) - 150 concurrent workers
+# was never going to run in real parallel on a couple of CPUs anyway; excess
+# workers past that just contend for the same CPU time without adding
+# throughput.
+#
+# prefork MPM
+# StartServers: number of server processes to start
+# MinSpareServers: minimum number of server processes which are kept spare
+# MaxSpareServers: maximum number of server processes which are kept spare
+# MaxRequestWorkers: maximum number of server processes allowed to start
+# MaxConnectionsPerChild: maximum number of requests a server process serves
+
+StartServers            5
+MinSpareServers         5
+MaxSpareServers         10
+MaxRequestWorkers       {{ nextcloud_apache_max_workers | default('40') }}
+MaxConnectionsPerChild  0

@@ -1,0 +1,20 @@
+---
+# Included with a var `images_to_scan: [ "image:tag", ... ]`.
+# Informational only - findings are printed, nothing here fails the play.
+# Uses Grype as a throwaway container; it pulls image manifests straight
+# from the registry, so no docker.sock access is needed for this.
+
+- name: "Scan images for known vulnerabilities using Grype (This can take a while)"
+  ansible.builtin.command: >
+    docker run --rm --memory=512m --cpus=1.0 anchore/grype:latest {{ item }} -o table
+  register: grype_scan_results
+  changed_when: false
+  failed_when: false
+  loop: "{{ images_to_scan }}"
+
+- name: "Vulnerability scan results"
+  ansible.builtin.debug:
+    msg: "{{ item.stdout_lines }}"
+  loop: "{{ grype_scan_results.results }}"
+  loop_control:
+    label: "{{ item.item }}"

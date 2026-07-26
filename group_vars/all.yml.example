@@ -1,0 +1,160 @@
+# Copy this file to group_vars/all.yml and fill in the site-specific values
+# marked below. The real all.yml is gitignored so your domain, email, and
+# bucket name never land in version control:
+#   cp group_vars/all.yml.example group_vars/all.yml
+#
+# Everything not marked REPLACE_WITH_... is a sensible default you can leave
+# as-is and tune later.
+
+# --- Site-specific: you MUST set these ---
+hostname: nc.example.com                 # the public FQDN this instance serves
+acme_email: admin@example.com            # Let's Encrypt registration/expiry email
+nextcloud_admin_user: admin
+compose_dir: /opt/docker-conf
+
+network_subnet: 172.28.0.0/16
+db_network_subnet: 172.30.0.0/24
+
+traefik_image: "traefik:v3.7"
+traefik_memory_limit: "512m"
+traefik_cpus: "1.0"
+
+socket_proxy_memory_limit: "128m"
+socket_proxy_cpus: "0.25"
+postgres_image: "postgres:18-trixie"
+nextcloud_image: "nextcloud:34-apache"
+valkey_image: "valkey/valkey:9-alpine"
+
+postgres_memory_limit: "2g"
+postgres_cpus: "1.0"
+nextcloud_memory_limit: "2g"
+nextcloud_cpus: "2.0"
+
+# Valkey - Redis-protocol caching + transactional file locking backend for
+# Nextcloud (see REDIS_HOST* env vars on the nextcloud/cron services).
+# Small and cache-only, so tight limits are fine.
+valkey_memory_limit: "128m"
+valkey_cpus: "0.25"
+
+# PHP tuning - these two feed the image's own documented PHP_UPLOAD_LIMIT /
+# PHP_MEMORY_LIMIT env vars (see docker-compose.yml.j2); further custom PHP
+# settings the image has no env var for live in templates/z-nextcloud-php.ini.j2.
+# Note nextcloud_php_memory_limit is the *PHP* memory_limit (doesn't need to
+# scale with upload size), separate from nextcloud_memory_limit above (the
+# *container's* Docker memory ceiling).
+nextcloud_max_upload_size: "3072M"
+nextcloud_php_memory_limit: "512M"
+# Opcache shared memory in MB (PHP_OPCACHE_MEMORY_CONSUMPTION). The image
+# default is 128; 256 leaves headroom since JIT (enabled by the image)
+# increases opcache usage. Optional - omit to get 256.
+nextcloud_php_opcache_memory: "256"
+
+# Cron sidecar - runs the official image's built-in /cron.sh, which loops
+# cron.php every 5 minutes. Needed for background jobs generally, and
+# specifically required for the News app to fetch RSS feeds at all.
+nextcloud_cron_memory_limit: "512m"
+nextcloud_cron_cpus: "1.0"
+
+# Hour of the day (0-23, UTC, NOT your local time) that daily resource-heavy
+# background jobs (previews, file recognition, etc.) are allowed to start
+# in - Nextcloud runs them in a ~4 hour window from this hour. Pick
+# something that's late-night/early-morning in your users' actual timezone.
+nextcloud_maintenance_window_start: 4
+
+# Postgres tuning - these should scale with postgres_memory_limit if you
+# bump it later. Rough rule of thumb: shared_buffers ~25% of the limit,
+# effective_cache_size ~75%. Assumes SSD-backed storage (typical for KVM
+# VPS); if your disk is actually spinning rust, raise random_page_cost
+# back up toward 4 (the Postgres default).
+postgres_shared_buffers: "512MB"
+postgres_effective_cache_size: "1536MB"
+postgres_maintenance_work_mem: "128MB"
+postgres_work_mem: "16MB"
+postgres_max_connections: "100"
+
+# Apache's max concurrent worker processes (nextcloud service only - cron
+# runs cron.php via CLI, no Apache involved). Keep this well under
+# postgres_max_connections above: each concurrent Apache worker can hold
+# its own Postgres connection for the duration of a request, and a big
+# enough burst (e.g. opening the Photos view against a library with no
+# cached previews yet, which fires off many simultaneous preview-generation
+# requests) can otherwise exceed what Postgres allows, and requests start
+# failing with "sorry, too many clients already". Also sized for the actual
+# CPU budget (nextcloud_cpus) - more workers than that doesn't add real
+# throughput, just contention.
+nextcloud_apache_max_workers: "40"
+
+# Backups
+remote_backup_dir: /opt/docker-conf/backups
+local_backup_dir: ./backups
+fetch_backups_locally: true
+# How many encrypted backups to keep - older ones get deleted after each
+# successful backup run, on both the VPS and the local control machine.
+backup_retention_count: 8
+
+# --- Optional: S3 primary storage (Backblaze B2, or any S3-compatible
+# provider) ---
+# Uses the official nextcloud image's built-in OBJECTSTORE_S3_* environment
+# variable support - see docker-compose.yml.j2 - rather than a hand-rolled
+# config.php file. This is the storage model this repo is built and tested
+# around (see the README's Highlights), and what the SSE-C-related backup/
+# restore behavior assumes - recommended unless you specifically want local
+# disk storage instead. Disabled by default: leave everything below
+# commented out to fall back to Nextcloud's own default local storage under
+# the nc_data volume - no other changes needed for that path, and nothing
+# below renders or needs a secret file.
+#
+# To enable: uncomment and fill in from your bucket's details page in your
+# provider's console, add vault_s3_key_id/vault_s3_secret_key/
+# vault_s3_sse_c_key to vault.yml, and re-run playbook.yml.
+# s3_bucket: "REPLACE_WITH_YOUR_BUCKET_NAME"
+# s3_region: "REPLACE_WITH_YOUR_BUCKET_REGION" # e.g. us-west-004
+# s3_hostname: "REPLACE_WITH_YOUR_S3_ENDPOINT" # e.g. s3.us-west-004.backblazeb2.com
+# s3_port: "443"
+# s3_use_ssl: "true"
+# s3_use_path_style: "true"
+#
+# Any S3-compatible provider works here, not just B2 - the same six vars
+# above just need to point at a different endpoint. Example values for AWS
+# S3 (not tested against this deployment, since it runs on B2 - adjust
+# bucket/region/key as needed):
+#
+# s3_bucket: "REPLACE_WITH_YOUR_BUCKET_NAME"
+# s3_region: "us-east-1"
+# s3_hostname: "s3.us-east-1.amazonaws.com"   # regional endpoint
+# s3_port: "443"
+# s3_use_ssl: "true"
+# s3_use_path_style: "false"   # AWS deprecated path-style requests for new
+#                               # buckets; most non-AWS S3-compatible stores
+#                               # (B2, MinIO, Wasabi, R2, DO Spaces) still
+#                               # need this set to "true"
+#
+# Full option reference (including the underlying config.php keys these env
+# vars map to):
+# https://docs.nextcloud.com/server/stable/admin_manual/configuration_files/primary_storage.html
+
+# --- Optional: outgoing email (SMTP) ---
+# Disabled by default (nothing renders, no secret file needed). Without it,
+# Nextcloud cannot send ANY email - password resets, share invitations,
+# calendar reminders. To enable: uncomment and fill in below, add
+# vault_smtp_password to vault.yml (use "" for an unauthenticated relay),
+# and re-run playbook.yml. Uses the image's own SMTP_* env var support -
+# full reference: https://github.com/nextcloud/docker#auto-configuration-via-environment-variables
+# smtp_host: "smtp.example.com"
+# smtp_secure: "ssl"              # "ssl", "tls", or "" for none
+# smtp_port: "465"                # 465 for ssl, 587 for tls/STARTTLS, 25 for none
+# smtp_authtype: "LOGIN"
+# smtp_name: "user@example.com"   # auth username; "" for no auth
+# mail_from_address: "nextcloud"  # local part of the From: address
+# mail_domain: "example.com"      # domain part of the From: address
+
+# Log retention - all containers log via the journald driver (see
+# docker-compose.yml.j2), so retention/rotation is handled by journald
+# itself (see journald-retention.conf.j2) rather than Docker's own drivers,
+# which only support size-based rotation and not age-based deletion.
+docker_log_retention_days: 21
+journald_system_max_use: "2G"
+
+# --- Site-specific: the key id, email, or fingerprint matching
+# files/backup_public_key.asc (see files/backup_public_key.asc.README) ---
+gpg_recipient_key_id: "REPLACE_WITH_YOUR_KEY_ID_OR_EMAIL"

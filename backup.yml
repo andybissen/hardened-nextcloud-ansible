@@ -1,0 +1,497 @@
+---
+# Run on its own any time: ansible-playbook backup.yml --ask-vault-pass
+# Also imported automatically by nextcloud-upgrade.yml before it touches anything.
+#
+# One-time setup before this works:
+#   1. Export your public PGP key:  gpg --export --armor <key-id-or-email> > files/backup_public_key.asc
+#   2. Set gpg_recipient_key_id in group_vars/all.yml to that same key id/email/fingerprint.
+#
+# Note: group_vars/vault.yml itself is intentionally NOT included in the
+# backup - everything in the encrypted bundle is assembled and encrypted
+# entirely on the VPS, from files that live on the VPS. vault.yml only
+# exists on the control machine, so it's out of scope here; its secrets
+# are expected to be saved separately (e.g. in a password manager).
+
+- name: Backup Nextcloud stack (Postgres + data volume + TLS certs), encrypted
+  hosts: nextcloud_servers
+  become: false
+
+  vars_files:
+    - group_vars/vault.yml
+
+  tasks:
+    - name: Ensure backup dependencies are installed
+      ansible.builtin.dnf:
+        name:
+          - gnupg2
+          - zstd
+          - rsync
+        state: present
+
+    - name: Compute backup timestamp
+      ansible.builtin.set_fact:
+        backup_timestamp: "{{ lookup('pipe', 'date +%Y%m%d-%H%M%S') }}"
+
+    - name: Ensure remote backup directory exists
+      ansible.builtin.file:
+        path: "{{ remote_backup_dir }}"
+        state: directory
+        mode: "0750"
+
+    - name: Create a staging directory for this backup's raw files
+      ansible.builtin.file:
+        path: "{{ remote_backup_dir }}/staging-{{ backup_timestamp }}"
+        state: directory
+        mode: "0750"
+
+    - name: Copy the backup recipient's public key to the host
+      ansible.builtin.copy:
+        src: files/backup_public_key.asc
+        dest: /tmp/backup_public_key.asc
+        mode: "0644"
+
+    - name: Import the public key into root's GPG keyring
+      ansible.builtin.command: gpg --batch --import /tmp/backup_public_key.asc
+      changed_when: false
+
+    # --- Pre-flight: fail before the (potentially slow, disk-heavy) dump if
+    # the recipient key is wrong, the stack isn't up, or there isn't room to
+    # stage the archive. Tagged preflight so `--tags preflight` runs just
+    # these against a deployed host. ---
+    - name: Verify the backup recipient key actually resolves in the keyring
+      # Catches a gpg_recipient_key_id that names a key we didn't import (or
+      # a typo) up front, instead of after the whole dump+archive, when the
+      # encrypt step would otherwise fail.
+      ansible.builtin.command: "gpg --list-keys {{ gpg_recipient_key_id }}"
+      register: preflight_gpg_recipient
+      changed_when: false
+      failed_when: preflight_gpg_recipient.rc != 0
+      tags: [preflight]
+
+    - name: Assert rsync is present on the control machine
+      # The final fetch (synchronize, mode: pull) runs rsync on the control
+      # machine to pull the encrypted backup down. A missing local rsync
+      # would otherwise only surface at the very end, after the whole
+      # dump/archive/encrypt has already run. Only relevant when actually
+      # fetching a local copy.
+      ansible.builtin.command: rsync --version
+      register: preflight_rsync
+      changed_when: false
+      failed_when: preflight_rsync.rc != 0
+      delegate_to: localhost
+      run_once: true
+      when: fetch_backups_locally | bool
+      tags: [preflight]
+
+    - name: Confirm the containers needed for a consistent backup are running
+      community.docker.docker_container_info:
+        name: "{{ item }}"
+      register: preflight_backup_containers
+      loop:
+        - pg_db
+        - nextcloud_app
+      tags: [preflight]
+
+    # Distilled to just name + running state before the assert below loops
+    # over it - looping the assert directly over
+    # preflight_backup_containers.results would dump each container's full
+    # `docker inspect` output (Args, Config, etc.) to the console on every
+    # run, since loop_control.label only trims the task's header line, not
+    # the per-item result body underneath it.
+    - name: Distill container info down to name + running state
+      # Starts from [] on the first iteration rather than appending to any
+      # previous value: set_fact facts persist for the host across plays in
+      # a single ansible-playbook run, so if this play ever runs twice in
+      # one invocation (chained playbooks on the CLI, a second import), a
+      # plain append would carry the first run's entries - and its possibly
+      # stale running-states - into the second.
+      ansible.builtin.set_fact:
+        preflight_container_states: "{{ ([] if ansible_loop.first else preflight_container_states) + [{'name': item.item, 'running': item.exists and (item.container.State.Running | default(false))}] }}"
+      loop: "{{ preflight_backup_containers.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+        extended: true
+      tags: [preflight]
+
+    - name: Assert those containers are actually up
+      ansible.builtin.assert:
+        that:
+          - item.running
+        fail_msg: >-
+          Container {{ item.name }} is not running - can't take a consistent
+          backup (the DB dump and nc_data archive both need it). Bring the
+          stack up first.
+      loop: "{{ preflight_container_states }}"
+      loop_control:
+        label: "{{ item.name }}"
+      tags: [preflight]
+
+    - name: Measure the Nextcloud data volume size
+      # Default data-root, uncustomized (see setup_host.yml), so the volume
+      # lives at this fixed path. Tiny with S3 primary storage; potentially
+      # many GB with local storage - which is exactly why the free-space
+      # check below matters more once local storage is in use.
+      ansible.builtin.command: du -sb /var/lib/docker/volumes/nc_data/_data
+      register: preflight_ncdata_size
+      changed_when: false
+      failed_when: false
+      tags: [preflight]
+
+    - name: Measure free space where the backup is staged
+      ansible.builtin.command: "df -B1 --output=avail {{ remote_backup_dir }}"
+      register: preflight_backup_avail
+      changed_when: false
+      tags: [preflight]
+
+    - name: Assert there's room to stage the backup
+      # Rough floor: ~2x the data volume (the uncompressed nc_data tar and
+      # the compressed bundle briefly coexist in staging) plus 500MB for the
+      # DB dump, certs, and headroom. The .zst is smaller than 2x in
+      # practice, so this errs safe.
+      ansible.builtin.assert:
+        that:
+          - (preflight_backup_avail.stdout_lines[1] | int) > ((preflight_ncdata_size.stdout.split()[0] | int) * 2 + 524288000)
+        fail_msg: >-
+          Not enough free space in {{ remote_backup_dir }}:
+          ~{{ ((preflight_backup_avail.stdout_lines[1] | int) / 1048576) | round | int }}MB
+          free, but a backup needs roughly 2x the
+          {{ ((preflight_ncdata_size.stdout.split()[0] | int) / 1048576) | round | int }}MB
+          data volume plus headroom. Free up space or lower
+          backup_retention_count.
+      when: preflight_ncdata_size.rc == 0
+      tags: [preflight]
+
+    # --- Gather the raw material (uncompressed - the final bundle gets
+    # compressed once, as a whole, further down) ---
+
+    # pg_dump alone is transactionally consistent (an MVCC snapshot), but
+    # the DB dump and the nc_data archive below are still two separate
+    # snapshots taken moments apart. Without pausing writes in between, a
+    # file uploaded in that window could land in one snapshot and not the
+    # other. Maintenance mode makes the pair consistent; the block/always
+    # guarantees it's switched back off even if a step below fails, so a
+    # failed backup never leaves the instance stuck read-only. Scoped to
+    # just these two steps - the Traefik certs archive further down is an
+    # unrelated volume with no consistency dependency on this pair, so it
+    # stays outside the window.
+    - name: Put Nextcloud into maintenance mode for a consistent snapshot
+      community.docker.docker_container_exec:
+        container: nextcloud_app
+        command: php occ maintenance:mode --on
+
+    - name: Snapshot the DB and data volume while writes are paused
+      block:
+        - name: Dump the Postgres database directly to disk (streamed, not buffered by Ansible)
+          # Piping straight to a file means pg_dump's output streams from the
+          # container to disk via the shell's own file descriptor, the same way
+          # it would if you ran this by hand - Ansible never holds the dump
+          # content in memory or ships it over SSH as module data, so this
+          # scales to a database of any size without memory pressure here.
+          # The password comes from the secret file already mounted in the
+          # container, so it never appears in the command line or Ansible logs.
+          ansible.builtin.shell: >
+            docker exec pg_db sh -c
+            'PGPASSWORD="$(cat /run/secrets/postgres_password)" pg_dump -U nextcloud nextcloud'
+            > {{ remote_backup_dir }}/staging-{{ backup_timestamp }}/nextcloud-db.sql
+          changed_when: true
+
+        - name: Archive the Nextcloud data volume (files + config.php) to staging
+          community.docker.docker_container:
+            name: "nc_data_backup_helper_{{ backup_timestamp }}"
+            image: alpine:latest
+            command: "tar cf /backup/staging-{{ backup_timestamp }}/nc_data.tar -C /source ."
+            memory: "256m"
+            cpus: "1.0"
+            volumes:
+              - "nc_data:/source:ro"
+              - "{{ remote_backup_dir }}:/backup:z"
+            auto_remove: true
+            detach: false
+            state: started
+      always:
+        - name: Take Nextcloud back out of maintenance mode
+          community.docker.docker_container_exec:
+            container: nextcloud_app
+            command: php occ maintenance:mode --off
+
+    - name: Archive the Traefik certs volume (acme.json + account key) to staging
+      # Easy to overlook, but this holds the Let's Encrypt private key and
+      # account key - losing it just means re-issuing a cert, but it's
+      # sensitive material and worth keeping with everything else.
+      community.docker.docker_container:
+        name: "traefik_certs_backup_helper_{{ backup_timestamp }}"
+        image: alpine:latest
+        command: "tar cf /backup/staging-{{ backup_timestamp }}/traefik_certs.tar -C /source ."
+        memory: "256m"
+        cpus: "1.0"
+        volumes:
+          - "traefik_certs:/source:ro"
+          - "{{ remote_backup_dir }}:/backup:z"
+        auto_remove: true
+        detach: false
+        state: started
+
+    # --- Verify the staged material before bundling/encrypting anything.
+    # This has to happen here, on the plaintext staged files, rather than
+    # after encryption - verifying the .gpg output would need the private
+    # key present and unlocked on the VPS, which never happens by design
+    # (see restore.yml/restore.md: decryption only ever happens on the
+    # control machine). Same "fail before doing something irreversible"
+    # idea as pg-major-upgrade.yml's dump-size check, applied here before
+    # the plaintext staging dir gets deleted. ---
+
+    - name: Stat each staged backup component
+      ansible.builtin.stat:
+        path: "{{ remote_backup_dir }}/staging-{{ backup_timestamp }}/{{ item }}"
+      loop:
+        - nextcloud-db.sql
+        - nc_data.tar
+        - traefik_certs.tar
+      register: staged_backup_files
+
+    - name: Abort if any staged component is missing or implausibly small
+      ansible.builtin.fail:
+        msg: >-
+          {{ item.item }} is missing or under 1KB in
+          {{ remote_backup_dir }}/staging-{{ backup_timestamp }} - refusing
+          to bundle/encrypt/prune. The staging dir is left in place for
+          investigation; the previous backup(s) are untouched.
+      loop: "{{ staged_backup_files.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when: not item.stat.exists or item.stat.size < 1024
+
+    - name: Verify the staged tar archives aren't corrupt
+      ansible.builtin.command: >
+        tar -tf {{ remote_backup_dir }}/staging-{{ backup_timestamp }}/{{ item }}
+      loop:
+        - nc_data.tar
+        - traefik_certs.tar
+      loop_control:
+        label: "{{ item }}"
+      changed_when: false
+
+    - name: Assert nc_data.tar isn't suspiciously small relative to the live volume
+      # An uncompressed tar of this volume can only ever be roughly as large
+      # as (or a bit larger than, from per-file header overhead) the raw
+      # content it holds - never smaller. If nc_data mounted but came up
+      # empty or degraded rather than failing outright, tar would still exit
+      # 0 and produce a small-but-technically-valid archive that the flat
+      # >1KB check above wouldn't catch. Comparing against the live du -sb
+      # measurement taken during preflight (before maintenance mode) does.
+      # The 50% floor, rather than something closer to 100%, tolerates
+      # normal du/tar measurement variance without being so loose it misses
+      # a real problem.
+      ansible.builtin.assert:
+        that:
+          - (staged_backup_files.results | selectattr('item', 'equalto', 'nc_data.tar') | map(attribute='stat.size') | first) >= ((preflight_ncdata_size.stdout.split()[0] | int) * 0.5)
+        fail_msg: >-
+          nc_data.tar is
+          {{ staged_backup_files.results | selectattr('item', 'equalto', 'nc_data.tar') | map(attribute='stat.size') | first }}
+          bytes, but the live nc_data volume measured
+          {{ preflight_ncdata_size.stdout.split()[0] }} bytes at the start of
+          this run - the archive looks suspiciously small relative to what
+          it should contain. This can happen if the volume mounted but came
+          up empty or degraded rather than failing outright. Refusing to
+          bundle/encrypt/prune; the staging dir is left in place for
+          investigation.
+      # rc | default(1): this task is untagged (it verifies the staged
+      # output, so it belongs to the main flow) but the du measurement it
+      # compares against is tagged preflight - under --skip-tags preflight
+      # the register never exists at all, and a bare .rc reference would
+      # error here instead of skipping. The flat-size and tar -tf checks
+      # above still run in that case.
+      when: (preflight_ncdata_size.rc | default(1)) == 0
+
+    # --- Bundle everything into one zstd-compressed tarball, then encrypt ---
+
+    - name: Bundle staged files into a single zstd-compressed tarball
+      ansible.builtin.command: >
+        tar --zstd -cf {{ remote_backup_dir }}/nextcloud-backup-{{ backup_timestamp }}.tar.zst
+        -C {{ remote_backup_dir }}/staging-{{ backup_timestamp }} .
+      changed_when: true
+
+    - name: Verify the bundle is a valid zstd archive before trusting it
+      # tar --zstd -tf decompresses the whole zstd stream (catching a
+      # truncated/corrupt compression) AND parses the tar structure inside
+      # it - the same thoroughness as the tar -tf check on the staged
+      # archives above, now applied to the bundle itself. This gates the
+      # staging-dir deletion below: the staged files are only redundant
+      # (and thus safe to delete before encryption) once we've confirmed
+      # the bundle that replaces them is intact.
+      ansible.builtin.command: >
+        tar --zstd -tf {{ remote_backup_dir }}/nextcloud-backup-{{ backup_timestamp }}.tar.zst
+      changed_when: false
+
+    - name: Remove the staging directory now that it's captured in the validated bundle
+      # Freed here, before encryption, rather than after: the bundle is a
+      # complete plaintext superset of everything in staging, so once it's
+      # validated the staging dir is pure redundancy. Dropping it now means
+      # the encrypt step holds only bundle + .gpg on disk instead of
+      # staging + bundle + .gpg - one final-backup-size lower peak, which
+      # matters most for local-storage deployments where nc_data.tar is
+      # many GB. The .zst is deliberately kept until AFTER the encryption
+      # recipient check below, preserving "never destroy the last plaintext
+      # copy until a verified encrypted copy exists".
+      ansible.builtin.file:
+        path: "{{ remote_backup_dir }}/staging-{{ backup_timestamp }}"
+        state: absent
+
+    - name: Encrypt the bundle with the recipient's public key
+      # --compress-algo none: the tarball is already zstd-compressed, so
+      # this stops GPG from wasting time trying to recompress it again.
+      # --trust-model always: skips the interactive trust prompt GPG would
+      # otherwise want, since this is a key you deliberately chose to use.
+      ansible.builtin.command: >
+        gpg --batch --yes --trust-model always --compress-algo none
+        --recipient {{ gpg_recipient_key_id }}
+        --output {{ remote_backup_dir }}/nextcloud-backup-{{ backup_timestamp }}.tar.zst.gpg
+        --encrypt {{ remote_backup_dir }}/nextcloud-backup-{{ backup_timestamp }}.tar.zst
+      changed_when: true
+
+    # --- Verify the encrypted output actually matches the recipient key,
+    # before anything irreversible (deleting the plaintext, pruning old
+    # backups) happens. GPG always encrypts to a key's dedicated encryption
+    # SUBKEY, never its primary key (primary is normally sign/certify-only -
+    # `gpg --list-keys` shows this as separate pub [SC] / sub [E] lines), so
+    # this has to check the encrypted-to key ID against ALL of the
+    # recipient's fingerprints (primary + every subkey), not just the first
+    # one - checking only the primary's fingerprint here previously produced
+    # a false-positive failure on an otherwise-correctly-encrypted backup.
+    #
+    # `gpg --list-packets` still prints the keyid we need on stdout even
+    # with only the public key present (the VPS never has the private key),
+    # but it ALSO attempts to decrypt the message to show the literal data
+    # packet's details, fails with "No secret key", and exits non-zero
+    # regardless - `|| true` on that one command tolerates the expected
+    # failed-decryption exit without masking a real failure in the
+    # subsequent match/mismatch check, which is what actually decides this
+    # task's outcome. ---
+
+    - name: Verify the backup was actually encrypted to the expected recipient
+      ansible.builtin.shell: |
+        set -euo pipefail
+        ENCRYPTED_TO=$(gpg --list-packets {{ remote_backup_dir }}/nextcloud-backup-{{ backup_timestamp }}.tar.zst.gpg 2>/dev/null | grep -oE 'keyid [A-F0-9]+' | awk '{print $2}' || true)
+        RECIPIENT_KEYIDS=$(gpg --with-colons --fingerprint {{ gpg_recipient_key_id }} | grep '^fpr:' | cut -d: -f10 | sed 's/.*\(.\{16\}\)$/\1/')
+        if [ -n "$ENCRYPTED_TO" ] && echo "$RECIPIENT_KEYIDS" | grep -qx "$ENCRYPTED_TO"; then
+          echo "Encrypted to $ENCRYPTED_TO, matches expected recipient {{ gpg_recipient_key_id }}"
+        else
+          echo "Encrypted to '${ENCRYPTED_TO:-<none found>}', which is none of the expected recipient's key IDs: $RECIPIENT_KEYIDS" >&2
+          exit 1
+        fi
+      register: key_verification
+      changed_when: false
+
+    - name: Remove the now-verified unencrypted bundle
+      # The staging dir was already removed right after the bundle was
+      # validated (before encryption); only the plaintext .tar.zst remains
+      # to clean up here, now that the encrypted copy is verified.
+      ansible.builtin.file:
+        path: "{{ remote_backup_dir }}/nextcloud-backup-{{ backup_timestamp }}.tar.zst"
+        state: absent
+
+    - name: Stat the encrypted backup before fetching it
+      ansible.builtin.stat:
+        path: "{{ remote_backup_dir }}/nextcloud-backup-{{ backup_timestamp }}.tar.zst.gpg"
+      register: encrypted_backup_stat
+      when: fetch_backups_locally | bool
+
+    - name: Ensure the local backup directory exists
+      # rsync creates the final dest dir but not missing parent levels;
+      # fetch used to auto-create the whole tree, so recreate that guarantee
+      # for a deeply-nested local_backup_dir.
+      ansible.builtin.file:
+        path: "{{ local_backup_dir }}"
+        state: directory
+        mode: "0700"
+      delegate_to: localhost
+      run_once: true
+      when: fetch_backups_locally | bool
+
+    - name: Report the backup size about to be fetched
+      # Ansible shows a task's output only when it finishes, so there's no
+      # live progress bar - stating the size up front means a large pull
+      # sitting on the next task reads as working, not stalled.
+      ansible.builtin.debug:
+        msg: >-
+          Fetching the
+          {{ (encrypted_backup_stat.stat.size / 1048576) | round | int }}MB
+          encrypted backup to {{ local_backup_dir }} on the control machine.
+      when: fetch_backups_locally | bool
+
+    - name: Fetch the encrypted backup down to the control machine
+      # rsync (via synchronize, mode: pull) instead of ansible.builtin.fetch:
+      # fetch slurps the whole file into memory and base64-encodes it over
+      # the connection - fine for a small bundle, but slow and memory-hungry
+      # on a multi-GB backup (local-storage deployments). mode: pull runs
+      # rsync on the control machine, pulling from the VPS.
+      # compress: false is deliberate and the opposite of restore.yml: the
+      # .tar.zst.gpg is already zstd-compressed AND encrypted (high entropy),
+      # so rsync -z would burn CPU for no size gain, unlike restore's
+      # uncompressed tars where compression helps. --info=progress2 puts a
+      # transfer summary in the result; --chmod keeps the local copy at 0600.
+      ansible.posix.synchronize:
+        src: "{{ remote_backup_dir }}/nextcloud-backup-{{ backup_timestamp }}.tar.zst.gpg"
+        dest: "{{ local_backup_dir }}/"
+        mode: pull
+        compress: false
+        rsync_opts:
+          - "--info=progress2"
+          - "--chmod=F600"
+      when: fetch_backups_locally | bool
+
+    # --- Retention pruning ---
+    # Find all .gpg backup files on the VPS, sort oldest-first, and
+    # delete any beyond backup_retention_count. Uses mtime so the sort
+    # order reflects actual file age rather than name sort (which would
+    # also work given the timestamp naming, but mtime is more robust).
+
+    - name: Find existing encrypted backups on the VPS
+      ansible.builtin.find:
+        paths: "{{ remote_backup_dir }}"
+        patterns: "nextcloud-backup-*.tar.zst.gpg"
+        file_type: file
+      register: remote_backup_files
+
+    - name: Prune old backups from the VPS beyond retention count
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: >-
+        {{
+          (remote_backup_files.files | sort(attribute='mtime') | list)
+          [: (remote_backup_files.files | length - backup_retention_count | int)]
+        }}
+      when: remote_backup_files.files | length > backup_retention_count | int
+
+    - name: Find existing encrypted backups on the control machine
+      ansible.builtin.find:
+        paths: "{{ local_backup_dir }}"
+        patterns: "nextcloud-backup-*.tar.zst.gpg"
+        file_type: file
+      delegate_to: localhost
+      run_once: true
+      register: local_backup_files
+      when: fetch_backups_locally | bool
+
+    - name: Prune old backups from the control machine beyond retention count
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      delegate_to: localhost
+      run_once: true
+      loop: >-
+        {{
+          (local_backup_files.files | sort(attribute='mtime') | list)
+          [: (local_backup_files.files | length - backup_retention_count | int)]
+        }}
+      when:
+        - fetch_backups_locally | bool
+        - local_backup_files.files | length > backup_retention_count | int
+
+    - name: Report backup location
+      ansible.builtin.debug:
+        msg: >-
+          Backup complete: nextcloud-backup-{{ backup_timestamp }}.tar.zst.gpg
+          (DB dump + Nextcloud data + Traefik certs)
+          {{ 'fetched to ' + local_backup_dir if fetch_backups_locally else 'left on the VPS at ' + remote_backup_dir }}

@@ -1,0 +1,412 @@
+# Pinned rather than left to auto-derive from compose_dir's basename: Docker
+# Compose prefixes every network it creates with the project name (e.g.
+# "docker-conf_web"), and Traefik needs that exact, real network name to
+# disambiguate which network to use for a backend that spans more than one
+# (see the nextcloud service's traefik.docker.network label below - it has
+# to match this name). Pinning it here means that label stays correct
+# regardless of what compose_dir is ever set to.
+name: nextcloud
+
+x-logging: &default-logging
+  driver: journald
+
+services:
+  socket-proxy:
+    image: tecnativa/docker-socket-proxy:latest
+    container_name: socket_proxy
+    restart: always
+    networks:
+      - socket_proxy_net
+    mem_limit: {{ socket_proxy_memory_limit }}
+    cpus: {{ socket_proxy_cpus }}
+    logging: *default-logging
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      CONTAINERS: 1   # Traefik needs to list containers
+      NETWORKS: 1     # and inspect networks
+      EVENTS: 1       # and watch start/stop events for live route updates
+      PING: 1
+      VERSION: 1
+      # Everything else defaults to 0: no EXEC, no BUILD, no COMMIT, no
+      # VOLUMES, no POST (write) access at all.
+      LOG_LEVEL: info
+
+  traefik:
+    image: {{ traefik_image }}
+    container_name: traefik
+    restart: always
+    depends_on:
+      - socket-proxy
+    networks:
+      - web
+      - socket_proxy_net
+    mem_limit: {{ traefik_memory_limit }}
+    cpus: {{ traefik_cpus }}
+    logging: *default-logging
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - traefik_certs:/letsencrypt
+      # TLS options (min version, PQC curve prefs, cipher list) and the
+      # HSTS middleware - dynamic config that can't be expressed as CLI
+      # flags; see the file itself for details.
+      - ./traefik/dynamic.yml:/etc/traefik/dynamic.yml:ro,Z
+    command:
+      - "--providers.docker=true"
+      - "--providers.docker.endpoint=tcp://socket-proxy:2375"
+      - "--providers.docker.exposedbydefault=false"
+      - "--providers.file.filename=/etc/traefik/dynamic.yml"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
+      - "--certificatesresolvers.myresolver.acme.httpchallenge=true"
+      - "--certificatesresolvers.myresolver.acme.httpchallenge.entrypoint=web"
+      - "--certificatesresolvers.myresolver.acme.email={{ acme_email }}"
+      - "--certificatesresolvers.myresolver.acme.storage=/letsencrypt/acme.json"
+      # ECDSA P-384 leaf certificate, matching the key_type/elliptic_curve
+      # the old certbot deployment used (default here would be RSA4096).
+      - "--certificatesresolvers.myresolver.acme.keytype=EC384"
+      - "--log.level=INFO"
+
+  postgres:
+    image: {{ postgres_image }}
+    container_name: pg_db
+    restart: always
+    networks:
+      - db_net
+    mem_limit: {{ postgres_memory_limit }}
+    cpus: {{ postgres_cpus }}
+    logging: *default-logging
+    environment:
+      POSTGRES_DB: nextcloud
+      POSTGRES_USER: nextcloud
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_buffers={{ postgres_shared_buffers }}"
+      - "-c"
+      - "effective_cache_size={{ postgres_effective_cache_size }}"
+      - "-c"
+      - "maintenance_work_mem={{ postgres_maintenance_work_mem }}"
+      - "-c"
+      - "work_mem={{ postgres_work_mem }}"
+      - "-c"
+      - "max_connections={{ postgres_max_connections }}"
+      - "-c"
+      - "random_page_cost=1.1"
+      - "-c"
+      - "effective_io_concurrency=200"
+      - "-c"
+      - "checkpoint_completion_target=0.9"
+      - "-c"
+      - "hba_file=/etc/postgresql-custom/pg_hba.conf"
+    volumes:
+      # Postgres 18+ moved its default data dir to a version-namespaced path
+      # (/var/lib/postgresql/<major>/docker) and the image's VOLUME now
+      # covers the parent /var/lib/postgresql, not .../data like pre-18
+      # images. Mounting here (rather than the old .../data path) is what
+      # actually makes the volume persist across container recreation.
+      - pg_data:/var/lib/postgresql
+      # Fixed path, independent of the versioned data dir above, so this
+      # survives future major-version bumps without needing to change.
+      - ./postgres/pg_hba.conf:/etc/postgresql-custom/pg_hba.conf:ro,Z
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nextcloud -d nextcloud"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  valkey:
+    image: {{ valkey_image }}
+    container_name: valkey
+    restart: always
+    networks:
+      - db_net
+    mem_limit: {{ valkey_memory_limit }}
+    cpus: {{ valkey_cpus }}
+    logging: *default-logging
+    command:
+      # requirepass lives in the config-file secret (first argument) rather
+      # than argv, so the password appears neither in `docker inspect` nor
+      # in process lists.
+      - "valkey-server"
+      - "/run/secrets/valkey_conf"
+      # Leaves headroom below the 128m container ceiling for Valkey's own
+      # process overhead, rather than letting it grow until the OOM killer
+      # hits it. LRU eviction is correct here since this is a cache/locking
+      # store, not a source of truth - losing entries just means a cache
+      # miss or a lock getting re-acquired, never data loss.
+      - "--maxmemory"
+      - "96mb"
+      - "--maxmemory-policy"
+      - "allkeys-lru"
+    secrets:
+      - valkey_conf
+      - valkey_password
+    healthcheck:
+      # $$ escapes compose's own variable interpolation so the $( ) runs
+      # in the container's shell.
+      test: ["CMD-SHELL", "valkey-cli -a \"$$(cat /run/secrets/valkey_password)\" --no-auth-warning ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  nextcloud:
+    image: {{ nextcloud_image }}
+    container_name: nextcloud_app
+    restart: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+    networks:
+      - web
+      - db_net
+    mem_limit: {{ nextcloud_memory_limit }}
+    cpus: {{ nextcloud_cpus }}
+    logging: *default-logging
+    environment:
+      POSTGRES_HOST: pg_db
+      POSTGRES_DB: nextcloud
+      POSTGRES_USER: nextcloud
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      # Redis-protocol caching/file-locking backend - Valkey is a drop-in
+      # here since the official image's autoconfig only speaks the
+      # Redis protocol env vars, not a Valkey-specific name.
+      REDIS_HOST: valkey
+      REDIS_HOST_PORT: 6379
+      REDIS_HOST_PASSWORD_FILE: /run/secrets/valkey_password
+      NEXTCLOUD_TRUSTED_DOMAINS: "{{ hostname }}"
+      # The image's own documented PHP-tuning knobs - it interpolates these
+      # into its bundled conf.d files (nextcloud.ini /
+      # opcache-recommended.ini). Those files load alphabetically AFTER any
+      # custom 99-*.ini, so setting these via the image's mechanism (rather
+      # than only in a custom ini file) is the supported way to make them
+      # stick; unset, the image defaults of 512M/512M/128 silently win.
+      # Everything the image has no env var for lives in
+      # z-php-custom.ini (see the volumes list below).
+      PHP_MEMORY_LIMIT: "{{ nextcloud_php_memory_limit }}"
+      PHP_UPLOAD_LIMIT: "{{ nextcloud_max_upload_size }}"
+      PHP_OPCACHE_MEMORY_CONSUMPTION: "{{ nextcloud_php_opcache_memory | default('256') }}"
+      OVERWRITEPROTOCOL: https
+      OVERWRITEHOST: "{{ hostname }}"
+      OVERWRITECLIURL: "https://{{ hostname }}"
+      TRUSTED_PROXIES: "{{ network_subnet }}"
+      NEXTCLOUD_ADMIN_USER: "{{ nextcloud_admin_user }}"
+      NEXTCLOUD_ADMIN_PASSWORD_FILE: /run/secrets/nextcloud_admin_password
+{% if s3_bucket is defined and s3_bucket %}
+      # S3 primary storage (Backblaze B2, or any S3-compatible provider) -
+      # official image's built-in objectstore support. AUTOCREATE is false
+      # since the bucket already exists and was created deliberately
+      # through the provider's own console. Rendered only when s3_bucket
+      # is set in all.yml - see the optional S3 section in all.yml.example.
+      # Omitted entirely, Nextcloud falls back to local storage under
+      # nc_data (its own default of /var/www/html/data), no changes needed.
+      OBJECTSTORE_S3_BUCKET: "{{ s3_bucket }}"
+      OBJECTSTORE_S3_REGION: "{{ s3_region }}"
+      OBJECTSTORE_S3_HOST: "{{ s3_hostname }}"
+      OBJECTSTORE_S3_PORT: "{{ s3_port }}"
+      OBJECTSTORE_S3_SSL: "{{ s3_use_ssl }}"
+      OBJECTSTORE_S3_USEPATH_STYLE: "{{ s3_use_path_style }}"
+      OBJECTSTORE_S3_AUTOCREATE: "false"
+      OBJECTSTORE_S3_KEY_FILE: /run/secrets/s3_key
+      OBJECTSTORE_S3_SECRET_FILE: /run/secrets/s3_secret
+      OBJECTSTORE_S3_SSE_C_KEY_FILE: /run/secrets/s3_sse_c_key
+{% endif %}
+{% if smtp_host is defined and smtp_host %}
+      # Outgoing email - read at RUNTIME by the image's smtp.config.php
+      # (getenv-based, like the REDIS_* vars, not baked into config.php at
+      # install), which is why this block must exist on BOTH the nextcloud
+      # and cron services: background jobs (calendar reminders, share
+      # notifications) send mail from the cron container, not this one.
+      # Rendered only when smtp_host is set in all.yml - see the optional
+      # SMTP section in all.yml.example.
+      SMTP_HOST: "{{ smtp_host }}"
+      SMTP_SECURE: "{{ smtp_secure | default('ssl') }}"
+      SMTP_PORT: "{{ smtp_port | default('465') }}"
+      SMTP_AUTHTYPE: "{{ smtp_authtype | default('LOGIN') }}"
+      SMTP_NAME: "{{ smtp_name | default('') }}"
+      SMTP_PASSWORD_FILE: /run/secrets/smtp_password
+      MAIL_FROM_ADDRESS: "{{ mail_from_address }}"
+      MAIL_DOMAIN: "{{ mail_domain }}"
+{% endif %}
+    secrets:
+{% if s3_bucket is defined and s3_bucket %}
+      - s3_key
+      - s3_secret
+      - s3_sse_c_key
+{% endif %}
+      - postgres_password
+      - nextcloud_admin_password
+      - valkey_password
+{% if smtp_host is defined and smtp_host %}
+      - smtp_password
+{% endif %}
+    volumes:
+      - nc_data:/var/www/html
+      # z- (not 99-): conf.d loads alphabetically and digits sort before
+      # letters, so a 99- file loses to the image's own nextcloud.ini and
+      # opcache-recommended.ini - z- is what actually loads last. Same
+      # trick, and same source/destination naming, as the apache confs below.
+      - ./nextcloud/z-php-custom.ini:/usr/local/etc/php/conf.d/z-nextcloud-custom.ini:ro,z
+      - ./nextcloud/z-apache-limits.conf:/etc/apache2/conf-enabled/z-nextcloud-limits.conf:ro,Z
+      - ./nextcloud/z-apache-hardening.conf:/etc/apache2/conf-enabled/z-nextcloud-hardening.conf:ro,Z
+      - ./nextcloud/z-deflate-disabled.conf:/etc/apache2/mods-enabled/deflate.conf:ro,Z
+      - ./nextcloud/z-mpm-prefork.conf:/etc/apache2/mods-enabled/mpm_prefork.conf:ro,Z
+    healthcheck:
+      test: ["CMD", "php", "-r", "if (@file_get_contents('http://localhost/status.php') === false) { exit(1); } exit(0);"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+    labels:
+      - "traefik.enable=true"
+      # nextcloud is on both `web` (shared with Traefik) and `db_net`
+      # (Traefik has no access to it) - without this, Traefik's choice of
+      # which network to actually dial is not guaranteed, and picking
+      # db_net silently hangs every request until it times out (504).
+      - "traefik.docker.network=nextcloud_web"
+      - "traefik.http.routers.nextcloud.rule=Host(`{{ hostname }}`)"
+      - "traefik.http.routers.nextcloud.entrypoints=websecure"
+      - "traefik.http.routers.nextcloud.tls.certresolver=myresolver"
+      # @file = defined in traefik/dynamic.yml (the file provider), since
+      # labels can only reference middlewares, not define their values.
+      # Order matters: rate-limit runs first so floods are rejected before
+      # any further processing.
+      - "traefik.http.routers.nextcloud.middlewares=rate-limit@file,security-headers@file"
+      - "traefik.http.services.nextcloud.loadbalancer.server.port=80"
+
+  cron:
+    # Same image, different entrypoint - the official image ships a
+    # /cron.sh script that loops cron.php every 5 minutes forever. This is
+    # what actually runs Nextcloud's background jobs (trash cleanup,
+    # calendar/contacts sync, activity, and - the reason this exists -
+    # RSS feed fetching for the News app, which explicitly does not work
+    # under AJAX or webcron modes, only real cron).
+    image: {{ nextcloud_image }}
+    container_name: nextcloud_cron
+    restart: always
+    entrypoint: /cron.sh
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+    networks:
+      - web
+      - db_net
+    mem_limit: {{ nextcloud_cron_memory_limit }}
+    cpus: {{ nextcloud_cron_cpus }}
+    logging: *default-logging
+    environment:
+      # Same locking backend as the main app - cron.php takes the same
+      # transactional file locks while it runs background jobs.
+      REDIS_HOST: valkey
+      REDIS_HOST_PORT: 6379
+      REDIS_HOST_PASSWORD_FILE: /run/secrets/valkey_password
+      # Same PHP tuning as the main app (see the comment there) - cron.php
+      # runs the same background jobs (previews, cleanup) and needs the
+      # same memory headroom; the upload limit is inert for CLI but kept
+      # identical so the two containers never drift.
+      PHP_MEMORY_LIMIT: "{{ nextcloud_php_memory_limit }}"
+      PHP_UPLOAD_LIMIT: "{{ nextcloud_max_upload_size }}"
+      PHP_OPCACHE_MEMORY_CONSUMPTION: "{{ nextcloud_php_opcache_memory | default('256') }}"
+{% if s3_bucket is defined and s3_bucket %}
+      # Same object store config as the main app - cron.php runs background
+      # jobs that touch files directly (trash cleanup, previews), so it
+      # needs identical S3 access, not just the web-facing container.
+      OBJECTSTORE_S3_BUCKET: "{{ s3_bucket }}"
+      OBJECTSTORE_S3_REGION: "{{ s3_region }}"
+      OBJECTSTORE_S3_HOST: "{{ s3_hostname }}"
+      OBJECTSTORE_S3_PORT: "{{ s3_port }}"
+      OBJECTSTORE_S3_SSL: "{{ s3_use_ssl }}"
+      OBJECTSTORE_S3_USEPATH_STYLE: "{{ s3_use_path_style }}"
+      OBJECTSTORE_S3_AUTOCREATE: "false"
+      OBJECTSTORE_S3_KEY_FILE: /run/secrets/s3_key
+      OBJECTSTORE_S3_SECRET_FILE: /run/secrets/s3_secret
+      OBJECTSTORE_S3_SSE_C_KEY_FILE: /run/secrets/s3_sse_c_key
+{% endif %}
+{% if smtp_host is defined and smtp_host %}
+      # Same SMTP config as the main app (see the comment there) - this is
+      # the container background-job emails actually get sent from.
+      SMTP_HOST: "{{ smtp_host }}"
+      SMTP_SECURE: "{{ smtp_secure | default('ssl') }}"
+      SMTP_PORT: "{{ smtp_port | default('465') }}"
+      SMTP_AUTHTYPE: "{{ smtp_authtype | default('LOGIN') }}"
+      SMTP_NAME: "{{ smtp_name | default('') }}"
+      SMTP_PASSWORD_FILE: /run/secrets/smtp_password
+      MAIL_FROM_ADDRESS: "{{ mail_from_address }}"
+      MAIL_DOMAIN: "{{ mail_domain }}"
+{% endif %}
+    secrets:
+{% if s3_bucket is defined and s3_bucket %}
+      - s3_key
+      - s3_secret
+      - s3_sse_c_key
+{% endif %}
+      - valkey_password
+{% if smtp_host is defined and smtp_host %}
+      - smtp_password
+{% endif %}
+    volumes:
+      - nc_data:/var/www/html
+      # z- for the same load-order reason as the nextcloud service above.
+      - ./nextcloud/z-php-custom.ini:/usr/local/etc/php/conf.d/z-nextcloud-custom.ini:ro,z
+
+networks:
+  web:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: {{ network_subnet }}
+  db_net:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: {{ db_network_subnet }}
+  socket_proxy_net:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.29.0.0/24
+
+volumes:
+  pg_data:
+    name: pg_data
+  nc_data:
+    name: nc_data
+  traefik_certs:
+    name: traefik_certs
+
+secrets:
+{% if s3_bucket is defined and s3_bucket %}
+  s3_key:
+    file: ./secrets/s3_key
+  s3_secret:
+    file: ./secrets/s3_secret
+  s3_sse_c_key:
+    file: ./secrets/s3_sse_c_key
+{% endif %}
+  postgres_password:
+    file: ./secrets/postgres_password
+  nextcloud_admin_password:
+    file: ./secrets/nextcloud_admin_password
+  valkey_password:
+    file: ./secrets/valkey_password
+  valkey_conf:
+    file: ./secrets/valkey.conf
+{% if smtp_host is defined and smtp_host %}
+  smtp_password:
+    file: ./secrets/smtp_password
+{% endif %}

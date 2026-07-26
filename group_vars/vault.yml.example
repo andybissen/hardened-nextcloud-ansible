@@ -1,0 +1,36 @@
+# Copy this file to group_vars/vault.yml, fill in real values, then encrypt it:
+#   cp group_vars/vault.yml.example group_vars/vault.yml
+#   # edit group_vars/vault.yml with real secrets, then:
+#   ansible-vault encrypt group_vars/vault.yml
+# Run any playbook with: ansible-playbook <playbook>.yml --ask-vault-pass
+#
+# The real vault.yml is gitignored and must NEVER be committed - not even in
+# its ansible-vault-encrypted form to a public repo, since that would make
+# your secrets a permanent offline-crackable artifact guarded only by the
+# vault passphrase. Keep these values in a password manager too.
+
+vault_postgres_password: "change-me-to-something-long-and-random"
+vault_nextcloud_admin_password: "change-me-too"
+# Keep this one ALPHANUMERIC - it is interpolated into a shell healthcheck,
+# so characters like $ " or \ would break the rendered compose file.
+vault_valkey_password: "change-me-too-a-long-random-one"
+
+# Only needed if you enable the optional S3 section in all.yml - see the
+# comments there. Access key/secret scoped to that s3_bucket - despite the
+# generic naming, these are still filled in from your provider's own
+# terminology for the same pair: Backblaze B2 calls them "Application Key
+# ID"/"Application Key", AWS calls them "Access Key ID"/"Secret Access Key",
+# etc. Works unmodified for whichever S3-compatible provider all.yml points
+# at - nothing provider-specific lives in this file.
+# vault_s3_key_id: "change-me"
+# vault_s3_secret_key: "change-me"
+# Generate with: openssl rand -base64 32
+# Guard this like the vault password itself - if it's ever lost, the data
+# encrypted with it is permanently unrecoverable, since the provider never
+# stores it. Note SSE-C isn't universal - AWS S3 and B2 both support it, but
+# confirm your specific provider does before relying on this.
+# vault_s3_sse_c_key: "change-me"
+
+# Only needed if you enable the optional SMTP section in all.yml - see the
+# comments there. Use "" for a relay that needs no authentication.
+# vault_smtp_password: "change-me"

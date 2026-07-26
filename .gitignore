@@ -1,0 +1,35 @@
+# Patterns here are relative to THIS directory, not the repo root - so
+# renaming or moving this whole directory elsewhere in (or out of) the
+# repo doesn't require touching this file. Git honors a .gitignore at any
+# directory level, applying it to that directory and everything below it.
+
+# --- Real per-site config (commit only the *.example versions) ---
+# These hold secrets or site-identifying values (domain, email, bucket).
+group_vars/vault.yml
+group_vars/all.yml
+inventory.ini
+
+# Your actual backup-encryption public key (generate your own; see
+# files/backup_public_key.asc.README). The .README stays tracked.
+files/backup_public_key.asc
+
+# --- Fetched/encrypted backups (never publish, even though encrypted) ---
+backups/
+*.tar.zst.gpg
+*.tar.zst
+
+# --- Ansible vault passphrase files, if you use one for unattended runs ---
+.vault_pass
+*.vault_pass
+vault_pass.txt
+
+# --- Ansible / tooling cruft ---
+*.retry
+__pycache__/
+*.pyc
+.ansible/
+
+# --- Local editor / OS / Claude Code local overrides (repo-wide, not tied
+# to any specific subdirectory) ---
+.claude/settings.local.json
+.DS_Store

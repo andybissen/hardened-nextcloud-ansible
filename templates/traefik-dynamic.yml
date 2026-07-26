@@ -1,0 +1,69 @@
+# Traefik dynamic configuration (file provider). TLS options and reusable
+# middlewares cannot be expressed as static CLI flags or Docker labels -
+# they have to come from a dynamic-config provider, which is why this file
+# exists alongside the CLI flags in docker-compose.yml.
+
+tls:
+  options:
+    # The special name "default" applies to every TLS connection Traefik
+    # terminates, with no per-router opt-in needed.
+    default:
+      minVersion: VersionTLS12
+      # Reject clients that don't send SNI - they can't be matched to a
+      # router anyway, and scanners probing the bare IP get dropped at the
+      # handshake instead of receiving a default certificate.
+      sniStrict: true
+      # Key-exchange preference, most-preferred first. X25519MLKEM768 is
+      # the NIST-standardized post-quantum hybrid (supported and default
+      # in Traefik >= 3.4.2, configurable by name since 3.5); classical
+      # curves remain as fallback for clients without PQC support. Note
+      # PQC key exchange only exists in TLS 1.3 - a TLS 1.2 client
+      # negotiates one of the classical curves below.
+      curvePreferences:
+        - X25519MLKEM768
+        - X25519
+        - CurveP384
+        - CurveP256
+      # TLS 1.2 only - Go (and therefore Traefik) does not allow
+      # restricting TLS 1.3 suites, because all three TLS 1.3 suites are
+      # considered safe. This list is the TLS 1.2 fallback: exactly two
+      # AEAD suites, ECDSA-only (matching the EC384 ACME key), no AES-128,
+      # no CBC, no RSA key exchange - the equivalent of the old nginx
+      # "ECDH+CHACHA20:ECDH+AESGCM:!AES128" with an ECDSA certificate.
+      cipherSuites:
+        - TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+        - TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
+
+http:
+  middlewares:
+    # HSTS is the one security header Traefik must add itself: the
+    # Nextcloud image's Apache already sends Referrer-Policy,
+    # X-Content-Type-Options, X-Frame-Options, X-Robots-Tag, and
+    # X-Permitted-Cross-Domain-Policies from its .htaccess, and
+    # duplicating those here would double the headers. Same max-age and
+    # flags as the old nginx config. WARNING (carried over from there):
+    # "preload" opts the domain into browsers' hardcoded HSTS lists via
+    # hstspreload.org - getting removed again can take months.
+    security-headers:
+      headers:
+        stsSeconds: 63072000
+        stsIncludeSubdomains: true
+        stsPreload: true
+
+    # Coarse per-source-IP flood protection in front of Nextcloud. Note what
+    # this is and isn't: it stops a single IP hammering the instance
+    # (scrapers, naive floods), but it is NOT login brute-force protection.
+    # Nextcloud's own throttling handles targeted credential attacks, and a
+    # global limit loose enough not to break desktop/mobile sync bursts is
+    # necessarily too loose to stop slow credential-stuffing - so the two
+    # layers cover different threats.
+    #
+    # Limits are per client IP. Traefik is the edge here (nothing proxies in
+    # front of it), so the real remote address is used and client-supplied
+    # X-Forwarded-For is not trusted. average/burst are deliberately generous
+    # so ordinary heavy use - a desktop client syncing many files, a busy
+    # PROPFIND storm - never trips them; lower them if you want a tighter cap.
+    rate-limit:
+      rateLimit:
+        average: 100   # sustained requests/second per source IP (period 1s)
+        burst: 200     # allowed spike above the average before throttling

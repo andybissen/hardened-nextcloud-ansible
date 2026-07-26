@@ -1,0 +1,182 @@
+---
+# Task file (not a standalone playbook) - included by playbook.yml and
+# restore.yml so both stay in sync. Renders docker-compose.yml and all
+# app config files into {{ compose_dir }} on the target host, and writes
+# the file-based Docker secrets. Does NOT bring the stack up - callers
+# decide when that should happen (immediately in playbook.yml; only after
+# volumes are restored, in restore.yml).
+#
+# Requires vault_b2_* vars (from group_vars/vault.yml) to already be in
+# scope.
+
+- name: Create deployment directory
+  ansible.builtin.file:
+    path: "{{ compose_dir }}"
+    state: directory
+    mode: "0750"
+
+- name: Render docker-compose.yml
+  ansible.builtin.template:
+    src: templates/docker-compose.yml.j2
+    dest: "{{ compose_dir }}/docker-compose.yml"
+    mode: "0640"
+  register: compose_file
+
+- name: Create a traefik/ subdirectory for Traefik dynamic config
+  ansible.builtin.file:
+    path: "{{ compose_dir }}/traefik"
+    state: directory
+    mode: "0750"
+
+- name: Copy the Traefik dynamic config (TLS options + HSTS middleware)
+  ansible.builtin.copy:
+    src: templates/traefik-dynamic.yml
+    dest: "{{ compose_dir }}/traefik/dynamic.yml"
+    mode: "0640"
+
+- name: Create a postgres/ subdirectory for Postgres-specific config
+  ansible.builtin.file:
+    path: "{{ compose_dir }}/postgres"
+    state: directory
+    mode: "0750"
+
+# 0644, not 0640: this is a bind mount (not a Docker secret), so the file's
+# host owner:group:mode apply verbatim inside the container. Unlike Apache
+# (root master process reads its config, then forks and drops privileges),
+# the official postgres image's entrypoint execs the server itself as the
+# non-root `postgres` user from the start - it reads hba_file as that user,
+# which has no host group in common with the root:root file Ansible writes,
+# so 0640 leaves it with zero access ("other" perms) and postgres refuses to
+# start ("could not open file ... Permission denied"). No secrets in this
+# file, so world-readable is fine - same reasoning as the secrets/ files.
+- name: Render pg_hba.conf
+  ansible.builtin.template:
+    src: templates/pg_hba.conf.j2
+    dest: "{{ compose_dir }}/postgres/pg_hba.conf"
+    mode: "0644"
+
+- name: Create a nextcloud/ subdirectory for Nextcloud-specific config
+  ansible.builtin.file:
+    path: "{{ compose_dir }}/nextcloud"
+    state: directory
+    mode: "0750"
+
+- name: Render the Nextcloud PHP tuning config
+  ansible.builtin.template:
+    src: templates/z-nextcloud-php.ini.j2
+    dest: "{{ compose_dir }}/nextcloud/z-php-custom.ini"
+    mode: "0640"
+
+- name: Copy the Apache request-body limit override
+  ansible.builtin.copy:
+    src: templates/z-nextcloud-apache-limits.conf
+    dest: "{{ compose_dir }}/nextcloud/z-apache-limits.conf"
+    mode: "0640"
+
+- name: Copy the Apache hardening config (banners, BREACH mitigation)
+  # z- prefix must sort after security.conf - see the comment in the
+  # source file for why.
+  ansible.builtin.copy:
+    src: templates/z-nextcloud-apache-hardening.conf
+    dest: "{{ compose_dir }}/nextcloud/z-apache-hardening.conf"
+    mode: "0640"
+
+- name: Copy the empty file that neutralizes the image's own deflate.conf
+  ansible.builtin.copy:
+    src: templates/z-deflate-disabled.conf
+    dest: "{{ compose_dir }}/nextcloud/z-deflate-disabled.conf"
+    mode: "0640"
+
+- name: Render the Apache MPM worker-concurrency override
+  ansible.builtin.template:
+    src: templates/z-mpm-prefork.conf.j2
+    dest: "{{ compose_dir }}/nextcloud/z-mpm-prefork.conf"
+    mode: "0640"
+
+# --- File-based Docker secrets (all of them - S3 keys, DB/Valkey/admin
+# passwords). Compose mounts each file into its containers at
+# /run/secrets/<name>; nothing sensitive appears in docker-compose.yml,
+# `docker inspect`, or container environments.
+#
+# The files are 0644 rather than 0600 because compose file-secrets are
+# plain bind mounts that keep host permissions, and several of these are
+# read inside their containers by NON-root users: Postgres re-reads its
+# password file after dropping to the postgres user, PHP reads the S3 and
+# Redis files as www-data, and valkey-server reads its conf as the valkey
+# user. Host-side protection comes from the 0700 directory - the same
+# model as Swarm secrets, which mount as 0444 inside containers.
+
+- name: Create a secrets/ subdirectory for file-based Docker secrets
+  ansible.builtin.file:
+    path: "{{ compose_dir }}/secrets"
+    state: directory
+    mode: "0700"
+
+# Optional - only when S3 primary storage is enabled in all.yml (see
+# all.yml.example's S3 section). Without it, Nextcloud falls back to local
+# storage under nc_data and none of these three secrets are needed.
+- name: Write the S3 access key to its secret file
+  ansible.builtin.copy:
+    content: "{{ vault_s3_key_id }}"
+    dest: "{{ compose_dir }}/secrets/s3_key"
+    mode: "0644"
+  no_log: true
+  when: s3_bucket is defined and s3_bucket | length > 0
+
+- name: Write the S3 secret key to its secret file
+  ansible.builtin.copy:
+    content: "{{ vault_s3_secret_key }}"
+    dest: "{{ compose_dir }}/secrets/s3_secret"
+    mode: "0644"
+  no_log: true
+  when: s3_bucket is defined and s3_bucket | length > 0
+
+- name: Write the SSE-C encryption key to its secret file
+  ansible.builtin.copy:
+    content: "{{ vault_s3_sse_c_key }}"
+    dest: "{{ compose_dir }}/secrets/s3_sse_c_key"
+    mode: "0644"
+  no_log: true
+  when: s3_bucket is defined and s3_bucket | length > 0
+
+- name: Write the Postgres password to its secret file
+  ansible.builtin.copy:
+    content: "{{ vault_postgres_password }}"
+    dest: "{{ compose_dir }}/secrets/postgres_password"
+    mode: "0644"
+  no_log: true
+
+- name: Write the Nextcloud admin password to its secret file
+  ansible.builtin.copy:
+    content: "{{ vault_nextcloud_admin_password }}"
+    dest: "{{ compose_dir }}/secrets/nextcloud_admin_password"
+    mode: "0644"
+  no_log: true
+
+- name: Write the Valkey password to its secret file
+  ansible.builtin.copy:
+    content: "{{ vault_valkey_password }}"
+    dest: "{{ compose_dir }}/secrets/valkey_password"
+    mode: "0644"
+  no_log: true
+
+# valkey-server has no _FILE-style env support, so the password rides in a
+# one-line config file passed as the server's first argument - keeping it
+# out of the container's argv (visible in process lists) as well.
+- name: Write the Valkey config (carries requirepass) to its secret file
+  ansible.builtin.copy:
+    content: "requirepass {{ vault_valkey_password }}\n"
+    dest: "{{ compose_dir }}/secrets/valkey.conf"
+    mode: "0644"
+  no_log: true
+
+# Optional - only when SMTP is enabled in all.yml (see all.yml.example's
+# SMTP section). Requires vault_smtp_password in vault.yml; use "" there
+# for a relay that needs no authentication.
+- name: Write the SMTP password to its secret file
+  ansible.builtin.copy:
+    content: "{{ vault_smtp_password }}"
+    dest: "{{ compose_dir }}/secrets/smtp_password"
+    mode: "0644"
+  no_log: true
+  when: smtp_host is defined and smtp_host | length > 0

@@ -1,0 +1,285 @@
+---
+# Postgres MAJOR-version upgrade (e.g. 18 -> 19), as one guarded command.
+#
+# Why this playbook exists: a Postgres container of major N+1 will REFUSE to
+# start on a data directory that major N initialized ("database files are
+# incompatible with server"). The official image does not run pg_upgrade for
+# you. So a major bump is not a tag swap - it is: dump the database, delete
+# the old data volume, let the new-major image do a fresh initdb, then reload
+# the dump. That is exactly what this playbook automates.
+#
+# For MINOR/patch Postgres updates you do NOT need this - the on-disk format
+# is stable within a major, so you just re-pull the same tag. See
+# docs/maintenance.md.
+#
+# Usage:
+#   ansible-playbook pg-major-upgrade.yml --ask-vault-pass \
+#     -e postgres_target_image=postgres:19-trixie
+#
+# Skip the interactive confirmation with -e pg_upgrade_confirm=true.
+#
+# Only ever cross ONE major at a time (18 -> 19, not 18 -> 20). Logical
+# dumps taken by the old server's pg_dump reload cleanly into the next major
+# for a schema like Nextcloud's; larger jumps are best done one step at a
+# time.
+
+- name: Full backup before the Postgres major upgrade
+  ansible.builtin.import_playbook: backup.yml
+
+- name: Upgrade Postgres to a new major version
+  hosts: nextcloud_servers
+  become: false
+
+  vars_files:
+    - group_vars/vault.yml
+
+  tasks:
+    - name: Fail fast if no target image was given
+      ansible.builtin.fail:
+        msg: "Pass the target image: -e postgres_target_image=postgres:19-trixie"
+      when: postgres_target_image is not defined
+
+    - name: Confirm the target Postgres tag exists in the registry
+      # 404 = no such tag; catch a typo'd image before we DELETE the data
+      # volume, not after (this playbook is destructive and irreversible
+      # short of the backup it just took).
+      ansible.builtin.uri:
+        url: "https://hub.docker.com/v2/repositories/library/postgres/tags/{{ postgres_target_image.split(':')[1] }}"
+        method: GET
+        status_code: [200]
+      register: pg_tag_exists
+      failed_when: pg_tag_exists.status != 200
+
+    - name: Read the currently deployed Postgres major version
+      community.docker.docker_container_exec:
+        container: pg_db
+        command: postgres --version
+      register: pg_current
+      changed_when: false
+      failed_when: false
+
+    - name: Refuse to guess when the running database can't be reached
+      # rc | default(1): a missing container fails at the module level with
+      # NO rc key in the result (confirmed live), so a bare .rc reference
+      # would error instead of firing this guard.
+      ansible.builtin.fail:
+        msg: >-
+          Could not read the deployed Postgres version from pg_db
+          (rc={{ pg_current.rc | default('unavailable') }}). The skip-a-major
+          guard can't run without it - make sure the database is up first, or
+          bypass with -e skip_version_guard=true if you're certain the jump
+          is valid.
+      when:
+        - not (skip_version_guard | default(false) | bool)
+        - (pg_current.rc | default(1)) != 0 or not (pg_current.stdout | default('') | regex_search('PostgreSQL'))
+
+    - name: Assert the jump is exactly one major ahead (never a skip or downgrade)
+      ansible.builtin.assert:
+        that:
+          - (target_major | int) == ((deployed_major | int) + 1)
+        fail_msg: >-
+          Refusing to move Postgres from major {{ deployed_major }} to
+          {{ target_major }}. This playbook does exactly ONE major at a time
+          ({{ deployed_major }} -> {{ (deployed_major | int) + 1 }}); it is
+          not for same-major re-pulls (use playbook.yml for those) or
+          downgrades. Bypass with -e skip_version_guard=true if you're certain.
+        success_msg: "Postgres jump {{ deployed_major }} -> {{ target_major }} is valid."
+      vars:
+        deployed_major: "{{ pg_current.stdout | regex_search('PostgreSQL\\)\\s*([0-9]+)', '\\1') | first }}"
+        target_major: "{{ postgres_target_image.split(':')[1].split('-')[0] }}"
+      when: not (skip_version_guard | default(false) | bool)
+
+    - name: Confirm this destructive upgrade
+      ansible.builtin.pause:
+        prompt: >-
+          This will DUMP the database, DELETE the pg_data volume, re-init
+          Postgres at {{ postgres_target_image }}, and reload the dump on
+          {{ inventory_hostname }}. A full backup was just taken. Press ENTER
+          to continue, or Ctrl+C then A to abort.
+      when: not (pg_upgrade_confirm | default(false) | bool)
+
+    - name: Compute an upgrade timestamp
+      ansible.builtin.set_fact:
+        pg_upgrade_timestamp: "{{ lookup('pipe', 'date +%Y%m%d-%H%M%S') }}"
+
+    - name: Create a staging directory for the migration dump
+      ansible.builtin.file:
+        path: "{{ remote_backup_dir }}/pg-upgrade-{{ pg_upgrade_timestamp }}"
+        state: directory
+        mode: "0750"
+      register: pg_upgrade_staging
+
+    # --- Quiesce writers, then take a fresh logical dump. Nextcloud and cron
+    # are stopped first so the dump can't miss writes that land after it. ---
+
+    - name: Stop Nextcloud and cron so nothing writes during the dump
+      community.docker.docker_compose_v2:
+        project_src: "{{ compose_dir }}"
+        state: stopped
+        services:
+          - nextcloud
+          - cron
+
+    - name: Dump the database to staging (streamed straight to disk)
+      # Same technique and secret-file password handling as backup.yml.
+      ansible.builtin.shell: >
+        docker exec pg_db sh -c
+        'PGPASSWORD="$(cat /run/secrets/postgres_password)" pg_dump -U nextcloud nextcloud'
+        > {{ pg_upgrade_staging.path }}/nextcloud-db.sql
+      changed_when: true
+
+    # Belt-and-suspenders: pg_dump failing already aborts the play (non-zero
+    # exit), but this refuses to proceed on a suspiciously tiny dump too -
+    # the next steps are irreversible.
+    - name: Stat the dump before doing anything destructive
+      ansible.builtin.stat:
+        path: "{{ pg_upgrade_staging.path }}/nextcloud-db.sql"
+      register: pg_dump_stat
+
+    - name: Abort if the dump is missing or implausibly small
+      ansible.builtin.fail:
+        msg: >-
+          The dump at {{ pg_upgrade_staging.path }}/nextcloud-db.sql is missing
+          or under 1KB - refusing to delete the data volume. The stack's
+          Postgres is still intact; investigate before retrying.
+      when: not pg_dump_stat.stat.exists or pg_dump_stat.stat.size < 1024
+
+    # --- Remove the old-major data directory ---
+
+    - name: Remove the Postgres container so its volume can be deleted
+      community.docker.docker_container:
+        name: pg_db
+        state: absent
+
+    - name: Delete the old-major pg_data volume
+      community.docker.docker_volume:
+        name: pg_data
+        state: absent
+
+    # --- Re-render at the new major and re-initialize ---
+
+    - name: Render docker-compose.yml with the new Postgres image
+      ansible.builtin.template:
+        src: templates/docker-compose.yml.j2
+        dest: "{{ compose_dir }}/docker-compose.yml"
+        mode: "0640"
+      vars:
+        postgres_image: "{{ postgres_target_image }}"
+
+    - name: Bring up Postgres only at the new major and wait for healthy (fresh initdb)
+      community.docker.docker_compose_v2:
+        project_src: "{{ compose_dir }}"
+        state: present
+        pull: policy
+        services:
+          - postgres
+        wait: true
+        wait_timeout: 120
+
+    - name: Reload the dump into the new-major database
+      ansible.builtin.shell: >
+        docker exec -i pg_db sh -c
+        'PGPASSWORD="$(cat /run/secrets/postgres_password)" psql -U nextcloud -d nextcloud'
+        < {{ pg_upgrade_staging.path }}/nextcloud-db.sql
+      changed_when: true
+
+    # --- Guard against the exact failure this playbook can otherwise cause:
+    # config.php (on nc_data, deliberately untouched by this playbook) can
+    # carry DB credentials from an earlier setup that no longer match the
+    # Postgres role just (re)created above - Nextcloud only ever
+    # auto-configures dbuser/dbpassword at its very first install, then
+    # reads them from config.php forever after, never re-consulting
+    # POSTGRES_USER/POSTGRES_PASSWORD_FILE again. Reconciling config.php
+    # here, before Nextcloud ever starts and tries to connect, makes that
+    # drift impossible to hit rather than discovering it after a failed
+    # "Bring the full stack up".
+
+    - name: Copy the config.php dbuser/dbpassword reconciliation script
+      ansible.builtin.copy:
+        src: templates/fix-nextcloud-dbuser.php
+        dest: "{{ compose_dir }}/nextcloud/fix-dbuser.php"
+        mode: "0640"
+
+    - name: Reconcile Nextcloud's config.php with the current Postgres credentials
+      community.docker.docker_container:
+        name: "nc_dbuser_fix_{{ pg_upgrade_timestamp }}"
+        image: "{{ nextcloud_image }}"
+        entrypoint:
+          - php
+          - /fix-nextcloud-dbuser.php
+        volumes:
+          - "nc_data:/var/www/html"
+          - "{{ compose_dir }}/secrets/postgres_password:/run/secrets/postgres_password:ro"
+          - "{{ compose_dir }}/nextcloud/fix-dbuser.php:/fix-nextcloud-dbuser.php:ro"
+        auto_remove: true
+        detach: false
+        state: started
+
+    # --- Back to full service ---
+
+    - name: Bring the full stack back up
+      community.docker.docker_compose_v2:
+        project_src: "{{ compose_dir }}"
+        state: present
+        pull: policy
+
+    - name: Wait for Nextcloud to report installed
+      community.docker.docker_container_exec:
+        container: nextcloud_app
+        command: php occ status
+      register: occ_status
+      until: |
+        occ_status.rc == 0 and 'installed: true' in occ_status.stdout
+      retries: 30
+      delay: 10
+
+    - name: Remove the staging dump
+      ansible.builtin.file:
+        path: "{{ pg_upgrade_staging.path }}"
+        state: absent
+
+    - name: Report result and the required all.yml follow-up
+      ansible.builtin.debug:
+        msg: >-
+          Postgres upgraded to {{ postgres_target_image }}.
+          IMPORTANT: set postgres_image in group_vars/all.yml to
+          "{{ postgres_target_image }}" now, or a later playbook.yml run will
+          re-render the OLD major and refuse to start on the new data dir.
+
+    - name: Remove the old Postgres image now that the upgrade succeeded
+      # docker_prune's dangling-only filter never catches this: postgres_image
+      # (the old tag, e.g. postgres:17-trixie) and postgres_target_image (the
+      # new one, e.g. postgres:18-trixie) are two DIFFERENT, independently
+      # tagged images - the old one doesn't become "dangling" just because
+      # this compose file stopped referencing it (dangling specifically means
+      # NO tag at all, <none>:<none>). A dangling-only prune only ever
+      # catches same-tag force-pulls (see docs/maintenance.md), never a major
+      # bump like this one - removing the old tag by name is what actually
+      # reclaims the space. Safe to run even if it's already gone (returns
+      # an empty result rather than failing).
+      community.docker.docker_image_remove:
+        name: "{{ postgres_image }}"
+      when: postgres_image != postgres_target_image
+
+    - name: Reclaim the orphaned old-major data volume
+      # A Postgres major upgrade leaves the previous major's data behind in
+      # an ANONYMOUS volume that the "Delete the old-major pg_data volume"
+      # step above never touches - that only removes the NAMED pg_data
+      # (confirmed live: a real 17->18 bump orphaned a full PG17 data dir in
+      # an anonymous volume). Runs after the health check above, so a failed
+      # or aborted upgrade never reaches it. Safe against the running stack:
+      # every named volume (pg_data/nc_data/traefik_certs) is mounted in a
+      # live container by this point, so an unused-volume prune can only take
+      # genuinely orphaned volumes, never one that's in use - the in-use
+      # check is the real guarantee, over and above modern Docker pruning
+      # only anonymous unused volumes by default.
+      community.docker.docker_prune:
+        volumes: true
+      register: pg_upgrade_volume_prune
+
+    - name: Report the reclaimed volume space
+      ansible.builtin.debug:
+        msg: >-
+          Pruned {{ pg_upgrade_volume_prune.volumes | default([]) | length }}
+          orphaned volume(s), reclaiming
+          {{ ((pg_upgrade_volume_prune.volumes_space_reclaimed | default(0)) / 1048576) | round | int }}MB.

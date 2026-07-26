@@ -1,0 +1,33 @@
+---
+# Re-scans the currently pinned images for newly-disclosed vulnerabilities,
+# on demand - independent of any deploy or upgrade.
+#
+# playbook.yml and nextcloud-upgrade.yml already run this same Grype scan
+# automatically, but only at the moment an image is about to change. A CVE
+# can be disclosed at any time against a version you're already running and
+# haven't touched - check-updates.py's version/EOL checks wouldn't catch
+# that (a newer tag might not even exist yet), which is what this is for.
+#
+# Deliberately kept separate from check-updates.py rather than merged into
+# it: Grype needs Docker to pull each image's manifest and run the scan,
+# and each image takes real seconds-to-tens-of-seconds - folding that into
+# check-updates.py would turn a fast, dependency-free, run-anytime check
+# into a slow one. This stays its own explicit action instead.
+#
+# Usage: ansible-playbook rescan-images.yml
+# No vault needed - the scan itself doesn't touch secrets.
+
+- name: Re-scan currently pinned images for known vulnerabilities
+  hosts: nextcloud_servers
+  become: false
+
+  tasks:
+    - name: Scan all stack images for known vulnerabilities
+      ansible.builtin.include_tasks: tasks/scan_images.yml
+      vars:
+        images_to_scan:
+          - "{{ traefik_image }}"
+          - "{{ postgres_image }}"
+          - "{{ nextcloud_image }}"
+          - "{{ valkey_image }}"
+          - "tecnativa/docker-socket-proxy:latest"

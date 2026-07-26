@@ -1,0 +1,16 @@
+This directory should contain backup_public_key.asc - the GPG public key
+that backup.yml encrypts every backup to. It's gitignored (see
+ansible/.gitignore) since it's generated per-deployment, not shared across
+clones of this repo - this file is the one that stays tracked in its place
+so the directory isn't just silently empty.
+
+To generate yours:
+
+    gpg --export --armor <your-key-id-or-email> > files/backup_public_key.asc
+
+Then set gpg_recipient_key_id in group_vars/all.yml to that same
+id/email/fingerprint. Full context: docs/install.md ("2d. Set up the backup
+encryption key") and docs/backup.md.
+
+Keep the matching PRIVATE key only on your control machine (or wherever you
+run restores from) - it must never be copied to the VPS. See docs/restore.md.
