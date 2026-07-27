@@ -51,6 +51,19 @@ things an assistant would otherwise have to rediscover the hard way.
   `local_backup_dir` and `backup_retention_count` are shared, fixed paths —
   don't assume a backup's filename or location implies which instance
   produced it.
+- **The task names in `check-deployed-versions.yml` are an API, not just
+  labels.** `check-updates.py --live` runs that playbook with the JSON
+  callback and looks each task up by name via its `deployed_task` keys, so
+  renaming or rewording a task there silently breaks `--live` — every
+  service just reports "could not determine", which reads like an
+  unreachable host rather than a rename. Nothing catches this:
+  `ansible-lint` doesn't see the Python file, and both sides pass their own
+  checks independently. This already happened once (a lint pass capitalized
+  the names, `check-updates.py` wasn't updated); the lookup is now
+  case-insensitive on both sides, so casing is safe, but a *reword* still
+  breaks it. Change a name there → update `deployed_task` in
+  `check-updates.py` in the same edit, and verify with an actual
+  `--live` run.
 
 ## Patterns to follow for new destructive/irreversible operations
 

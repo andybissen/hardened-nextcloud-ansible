@@ -261,14 +261,19 @@ def fetch_deployed_stdout():
             continue
         host_data = next(iter(host_results.values()))
         if not host_data.get("failed"):
-            stdout_by_task[task["task"]["name"]] = host_data.get("stdout", "")
+            # Keyed lowercase, and looked up the same way in
+            # parse_deployed_version, so the playbook's task-name casing
+            # doesn't matter - ansible-lint's name[casing] rule forces those
+            # names to start capitalized, and a mismatch here fails silently
+            # as "could not determine" rather than as an error.
+            stdout_by_task[task["task"]["name"].lower()] = host_data.get("stdout", "")
     return stdout_by_task
 
 
 def parse_deployed_version(image, stdout_by_task):
     """Returns a version tuple parsed from the deployed-versions playbook's
     output for this image, or None if it couldn't be determined."""
-    stdout = stdout_by_task.get(image["deployed_task"])
+    stdout = stdout_by_task.get(image["deployed_task"].lower())
     if not stdout:
         return None
     if "deployed_json_field" in image:
