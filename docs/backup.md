@@ -256,7 +256,22 @@ discover your weekly backups haven't been running. Setting
    loginctl enable-linger "$USER"
    ```
 
-5. Verify:
+5. **If your SSH key has a passphrase, point the service at your agent.** A
+   user service doesn't inherit `SSH_AUTH_SOCK` from your login session, so
+   ssh finds no agent and the run fails with `Permission denied
+   (publickey)` — which reads like a key problem on the server rather than a
+   missing agent. Add your agent's socket (`echo $SSH_AUTH_SOCK` in a normal
+   shell) to the `[Service]` section:
+
+   ```ini
+   Environment=SSH_AUTH_SOCK=/path/to/your/agent/socket
+   ```
+
+   This only works if the agent is running with the key unlocked when the
+   timer fires; a passphrase-less key used only for backups avoids the
+   question entirely.
+
+6. Verify:
 
    ```bash
    systemctl --user list-timers --all              # confirm next scheduled run
@@ -274,6 +289,12 @@ has no separate setting for a job's working directory:
 
 ```bash
 # crontab -e — weekly, Sunday 03:30
+SSH_AUTH_SOCK=/path/to/your/agent/socket
 30 3 * * 0 cd /path/to/repo && ansible-playbook backup.yml \
   --vault-password-file ~/.nc-vault-pass >> ~/nc-backup.log 2>&1
 ```
+
+The `SSH_AUTH_SOCK=` line is the same agent caveat as step 5 above — cron's
+environment doesn't have it either. Drop the line if your key has no
+passphrase, and note cron doesn't expand `~` in these assignments, so it
+needs an absolute path.
