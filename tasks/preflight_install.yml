@@ -102,11 +102,38 @@
     that:
       - hostname is defined and hostname != 'nc.example.com'
       - acme_email is defined and acme_email != 'admin@example.com'
+      - nextcloud_admin_user is defined and nextcloud_admin_user != 'REPLACE_WITH_YOUR_ADMIN_USERNAME'
       - gpg_recipient_key_id is defined and gpg_recipient_key_id != 'REPLACE_WITH_YOUR_KEY_ID_OR_EMAIL'
+      # Not a placeholder check: socket_proxy_image was added to
+      # all.yml.example after the initial release, and it is consumed
+      # unguarded by docker-compose.yml.j2. An all.yml predating it would
+      # otherwise fail at render time - i.e. AFTER setup_host.yml has
+      # already modified the host, which is the exact ordering this file
+      # exists to prevent.
+      - socket_proxy_image is defined
     fail_msg: >-
-      One or more required values in group_vars/all.yml is still the
-      placeholder from all.yml.example. Set real values for hostname,
-      acme_email, and gpg_recipient_key_id before deploying.
+      One or more required values in group_vars/all.yml is missing or still
+      the placeholder from all.yml.example. Set real values for hostname,
+      acme_email, nextcloud_admin_user, and gpg_recipient_key_id, and make
+      sure socket_proxy_image is present (copy it across from
+      all.yml.example if your all.yml predates that variable).
+
+# Warning rather than a hard fail, deliberately: NEXTCLOUD_ADMIN_USER is only
+# consumed during Nextcloud's FIRST install, so an existing instance can't fix
+# this by editing all.yml - the account already exists under the old name and
+# has to be replaced via occ. Failing the play would strand those deployments
+# with no way forward short of a rename they may not be ready to do.
+- name: Warn if the Nextcloud admin username is the predictable default
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: nextcloud_admin_user is "admin". That's the first username any
+      credential-stuffing or password-spraying run against this instance will
+      try, and it hands over half the credential pair for free. Pick something
+      non-obvious. On a FRESH install, change it in all.yml before deploying;
+      on a running instance editing all.yml has no effect - create a
+      replacement admin with `occ user:add --group=admin` and disable the old
+      account instead.
+  when: nextcloud_admin_user | default('') == 'admin'
 
 - name: Assert vault secrets are not still placeholders
   ansible.builtin.assert:

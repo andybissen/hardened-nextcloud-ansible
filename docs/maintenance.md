@@ -10,8 +10,8 @@ Run everything from this repo's root directory.
 
 ## Checking for updates
 
-`check-updates.py` is a `dnf check-update`-style report for all four pinned
-images (Traefik, Postgres, Nextcloud, Valkey). Run it anytime:
+`check-updates.py` is a `dnf check-update`-style report for all five pinned
+images (Traefik, socket-proxy, Postgres, Nextcloud, Valkey). Run it anytime:
 
 ```bash
 ./check-updates.py
@@ -125,6 +125,7 @@ by the pull, so repeated patching doesn't quietly eat disk over time.
 | **Traefik** | `traefik:v3.7` | minor | Terminates TLS; its *minors* add features and occasionally shift defaults/config, so restores should be reproducible to the minor and minor jumps should be a deliberate choice |
 | **Postgres** | `postgres:18-trixie` | major | Within-major is bugfix-only and safe to float; crossing a major needs a real migration, which is gated by `pg-major-upgrade.yml` |
 | **Valkey** | `valkey:9-alpine` | major | Stateless cache/lock store — blast radius of any surprise is a cache flush, so floating within a major costs nothing |
+| **socket-proxy** | `tecnativa/docker-socket-proxy:v0.5.0` | patch | The only container with any access to the Docker socket, so tag drift here has the highest blast radius of anything in the stack; upstream cuts releases roughly twice a year, making an exact pin cheap to carry |
 
 Why pin at all when some upgrades are trivial? Pinning isn't about upgrade
 *difficulty* — it's about (1) **deterministic restores** (a recovery brings
@@ -279,8 +280,12 @@ docker exec -u www-data nextcloud_app php occ config:system:set log_type --value
 
 ## Unpinned images (aside)
 
-`tecnativa/docker-socket-proxy:latest` and `alpine:latest` (backup/restore
-helpers) float on `latest`. That's acceptable — the proxy is stateless and
-the alpine helpers are ephemeral — but pinning the socket-proxy to a released
-tag would make fresh deploys and restores more reproducible if you want to
-tighten that later.
+`alpine:latest` (backup/restore helpers) still floats on `latest`. That's
+acceptable — those helpers are ephemeral and hold no state.
+
+The socket-proxy is no longer among them: it's pinned via `socket_proxy_image`
+in `all.yml` and reported by `check-updates.py` alongside everything else —
+release check only, since upstream has no endoflife.date cycle and the
+container exposes no way to report its own version to `--live`. Because it's
+an exact release rather than a floating tag, nothing ever reaches it via a
+force-pull: watch for **newer line available** and bump the pin deliberately.

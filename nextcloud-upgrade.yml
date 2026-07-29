@@ -84,9 +84,13 @@
     - group_vars/vault.yml
 
   tasks:
-    # Skip with: --skip-tags scan (see playbook.yml for the same option)
+    # Skip with: --skip-tags scan (see playbook.yml for the same option, and
+    # for why the tag has to be applied to the included tasks as well)
     - name: Scan the target image for known vulnerabilities
-      ansible.builtin.include_tasks: tasks/scan_images.yml
+      ansible.builtin.include_tasks:
+        file: tasks/scan_images.yml
+        apply:
+          tags: [scan]
       tags: [scan]
       vars:
         images_to_scan:

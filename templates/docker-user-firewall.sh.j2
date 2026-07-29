@@ -16,3 +16,31 @@ for PORT in "${PORTS[@]}"; do
     iptables -I DOCKER-USER -i "${IFACE}" -p tcp --dport "${PORT}" -j DROP
   fi
 done
+
+# Same backstop for IPv6. iptables rules do not cover v6 at all, so without
+# this the belt-and-suspenders layer simply doesn't exist on a host that
+# has IPv6 and a Docker daemon doing ip6tables NAT/filtering.
+#
+# Guarded rather than unconditional, and the guard is load-bearing: Docker
+# only creates a DOCKER-USER chain in ip6tables when the daemon has IPv6
+# handling enabled, so on a v4-only VPS the chain (and possibly the binary)
+# is absent. This script runs under `set -euo pipefail`, so an unguarded
+# ip6tables call there would exit non-zero, fail docker-user-firewall
+# .service, and take the Ansible run down with it. Probing both the binary
+# and the chain first means a v4-only host skips the block silently and
+# ends up exactly where it is today.
+#
+# .get() chaining rather than ['default_ipv6']['interface']: on a host with
+# no IPv6 default route Ansible reports default_ipv6 as an empty dict, and
+# subscripting a missing key on an Undefined raises rather than falling
+# through to a default filter. Falls back to the v4 interface, which is the
+# same NIC on a single-homed VPS anyway.
+V6_IFACE="{{ ansible_facts.get('default_ipv6', {}).get('interface') or ansible_facts['default_ipv4']['interface'] }}"
+
+if command -v ip6tables >/dev/null 2>&1 && ip6tables -n -L DOCKER-USER >/dev/null 2>&1; then
+  for PORT in "${PORTS[@]}"; do
+    if ! ip6tables -C DOCKER-USER -i "${V6_IFACE}" -p tcp --dport "${PORT}" -j DROP 2>/dev/null; then
+      ip6tables -I DOCKER-USER -i "${V6_IFACE}" -p tcp --dport "${PORT}" -j DROP
+    fi
+  done
+fi

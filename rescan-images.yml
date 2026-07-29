@@ -30,4 +30,4 @@
           - "{{ postgres_image }}"
           - "{{ nextcloud_image }}"
           - "{{ valkey_image }}"
-          - "tecnativa/docker-socket-proxy:latest"
+          - "{{ socket_proxy_image }}"
