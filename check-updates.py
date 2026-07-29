@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-dnf-check-update-style report for the four pinned container images in
+dnf-check-update-style report for the pinned container images in
 group_vars/all.yml, plus end-of-life status for whatever version each is
 currently pinned to.
 
@@ -47,6 +47,9 @@ Limitations, so the report isn't over-trusted:
     the pin here floats at the major (9-alpine). The EOL shown is for
     whichever minor is currently newest under that major, since that's
     what's actually running at any given time.
+  - Not every image supports every column. socket-proxy has no EOL data
+    upstream and no way to report its own version from inside the
+    container, so it gets the release check only - see its IMAGES entry.
 """
 
 import argparse
@@ -71,14 +74,20 @@ EOL_WARN_DAYS = 90
 
 # One entry per pinned image. prefix/suffix bracket the numeric version in
 # a full tag (e.g. traefik's "v3.7.7" = prefix "v", suffix ""; postgres's
-# "18.2-trixie" = prefix "", suffix "-trixie"). All four Docker Hub repos
-# use this same "<prefix><numbers><suffix>" shape for real release tags,
-# which is what makes one shared parser workable here.
+# "18.2-trixie" = prefix "", suffix "-trixie"). Every Docker Hub repo listed
+# here uses this same "<prefix><numbers><suffix>" shape for real release
+# tags, which is what makes one shared parser workable.
 #
-# deployed_task/deployed_regex/deployed_json_field are only used with
-# --live: they match a task name in check-deployed-versions.yml's output to
-# a regex (or, for Nextcloud, a JSON field) that pulls a plain "X.Y.Z"
-# version string back out of that command's raw stdout.
+# eol_slug is OPTIONAL: omit it for a project endoflife.date doesn't track,
+# and the EOL row is skipped for that image.
+#
+# deployed_task/deployed_regex/deployed_json_field are OPTIONAL too, and
+# only used with --live: they match a task name in
+# check-deployed-versions.yml's output to a regex (or, for Nextcloud, a JSON
+# field) that pulls a plain "X.Y.Z" version string back out of that
+# command's raw stdout. Omit them for a container that can't report its own
+# version, and the deployed row is skipped rather than showing a permanent
+# "could not determine".
 IMAGES = [
     {
         "label": "Traefik",
@@ -89,6 +98,22 @@ IMAGES = [
         "eol_slug": "traefik",
         "deployed_task": "check traefik version",
         "deployed_regex": r"Version:\s*v?([\d.]+)",
+    },
+    {
+        # Release-check only, deliberately. endoflife.date tracks no cycle
+        # for this project, and the container is HAProxy-based with no
+        # command that reports the proxy's OWN release (haproxy -v gives
+        # HAProxy's version, not v0.5.0), so there's nothing for --live to
+        # probe. Listed here anyway because this is the one image pinned to
+        # an exact release: it never picks anything up from a force-pull, so
+        # without a release check it would silently rot. Note its version
+        # line is 0.x, where new releases bump the MINOR - "newer line
+        # available" is therefore the signal to watch here, not a new major.
+        "label": "socket-proxy",
+        "var": "socket_proxy_image",
+        "hub_repo": "tecnativa/docker-socket-proxy",
+        "prefix": "v",
+        "suffix": "",
     },
     {
         "label": "Postgres",
@@ -366,7 +391,12 @@ def main():
         else:
             row("latest under this pin", "unknown (no matching tags found in recent history)")
 
-        if args.live:
+        # Images with no deployed_task can't answer "what's actually
+        # running" at all, so neither the row nor the --live hint applies -
+        # showing either would just be permanent noise.
+        supports_live = "deployed_task" in image
+
+        if args.live and supports_live:
             deployed = parse_deployed_version(image, deployed_stdout)
             if deployed is None:
                 row("deployed", "could not determine (container missing, host unreachable, etc.)")
@@ -380,7 +410,7 @@ def main():
                 attention_needed = True
             else:
                 row("deployed", f"{'.'.join(str(n) for n in deployed)}  (up to date)")
-        elif latest_within:
+        elif latest_within and supports_live:
             row("", "(run with --live to check whether this is actually what's deployed)")
 
         if beyond_pin:
@@ -396,16 +426,20 @@ def main():
         # (exact match for Traefik/Postgres/Nextcloud), then fall back to
         # a coarser major-only cycle (handles Valkey's major-only pin
         # against endoflife.date's per-minor cycles).
-        eol_entries = fetch_eol(image["eol_slug"])
-        lookup_source = list(latest_within or pin_numbers)
-        candidates = []
-        if len(lookup_source) >= 2:
-            candidates.append(".".join(str(n) for n in lookup_source[:2]))
-        candidates.append(str(lookup_source[0]))
-        eol_label, eol_value, eol_attention = format_eol(eol_entries, candidates)
-        if eol_label:
-            row(eol_label, eol_value)
-        attention_needed = attention_needed or eol_attention
+        # Skipped entirely for an image with no eol_slug - endoflife.date
+        # has nothing to say about it, and querying a made-up slug would
+        # just print a 404 warning on every run.
+        if image.get("eol_slug"):
+            eol_entries = fetch_eol(image["eol_slug"])
+            lookup_source = list(latest_within or pin_numbers)
+            candidates = []
+            if len(lookup_source) >= 2:
+                candidates.append(".".join(str(n) for n in lookup_source[:2]))
+            candidates.append(str(lookup_source[0]))
+            eol_label, eol_value, eol_attention = format_eol(eol_entries, candidates)
+            if eol_label:
+                row(eol_label, eol_value)
+            attention_needed = attention_needed or eol_attention
 
         print()
 

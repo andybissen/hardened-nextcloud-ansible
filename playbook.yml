@@ -14,8 +14,19 @@
     # Fails before setup_host.yml touches anything if the config or host is
     # unfit. Run just these with: ansible-playbook playbook.yml --tags preflight
     # (a dry-run config check that deploys nothing).
+    #
+    # `apply:` is load-bearing, not decoration. A tag on include_tasks (a
+    # DYNAMIC include) applies only to the include statement itself and is
+    # NOT inherited by the tasks in the included file - unlike import_tasks,
+    # where tags do propagate. Without apply, `--tags preflight` runs the
+    # include, then filters out every assertion inside it, and the run
+    # reports ok=2/changed=0 as though it had validated the config when it
+    # actually checked nothing at all.
     - name: Pre-flight validation
-      ansible.builtin.include_tasks: tasks/preflight_install.yml
+      ansible.builtin.include_tasks:
+        file: tasks/preflight_install.yml
+        apply:
+          tags: [preflight]
       tags: [preflight]
 
     - name: Set up the host (Docker, firewalld, DOCKER-USER, journald)
@@ -26,8 +37,14 @@
     # Worth skipping for a config-only re-run (e.g. tweaking z-apache-hardening.conf)
     # where no image tag changed - re-scanning all five images is the slowest
     # part of the run and finds nothing new if nothing pulled a fresh image.
+    # `apply:` for the same reason as the preflight include above - without
+    # it the tag covers only the include statement, so --skip-tags scan works
+    # (the include never runs) but --tags scan silently no-ops.
     - name: Scan all stack images for known vulnerabilities
-      ansible.builtin.include_tasks: tasks/scan_images.yml
+      ansible.builtin.include_tasks:
+        file: tasks/scan_images.yml
+        apply:
+          tags: [scan]
       tags: [scan]
       vars:
         images_to_scan:
@@ -35,7 +52,7 @@
           - "{{ postgres_image }}"
           - "{{ nextcloud_image }}"
           - "{{ valkey_image }}"
-          - "tecnativa/docker-socket-proxy:latest"
+          - "{{ socket_proxy_image }}"
 
     - name: Render docker-compose.yml and app config
       ansible.builtin.include_tasks: tasks/render_config.yml

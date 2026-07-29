@@ -48,10 +48,16 @@
       ansible.builtin.import_tasks: handlers/main.yml
 
   tasks:
+    # Tagged preflight (like the checks further down) so a --tags preflight
+    # validation run actually inspects the backup it was pointed at. Without
+    # the tag this is filtered out, and `--tags preflight -e
+    # restore_backup_file=...` silently ignores the file it was given -
+    # reporting a clean preflight for a path that may not even exist.
     - name: Fail fast if no backup file was given
       ansible.builtin.fail:
         msg: "Pass the backup to restore: -e restore_backup_file=./backups/nextcloud-backup-<timestamp>.tar.zst.gpg"
       when: restore_backup_file is not defined
+      tags: [preflight]
 
     - name: Confirm this destructive restore
       ansible.builtin.pause:
@@ -75,11 +81,13 @@
       delegate_to: localhost
       run_once: true
       register: restore_backup_stat
+      tags: [preflight]
 
     - name: Fail if the backup file was not found
       ansible.builtin.fail:
         msg: "{{ restore_backup_file }} does not exist on the control machine"
       when: not restore_backup_stat.stat.exists
+      tags: [preflight]
 
     # --- Pre-flight: control-machine tooling, vault sanity, and target host
     # fitness, before we decrypt anything or touch the target. Tagged
@@ -118,6 +126,23 @@
         fail_msg: >-
           Restore target must be a RHEL-family host (Rocky/RHEL/Alma).
           Detected: {{ ansible_facts['os_family'] | default('unknown') }}.
+      tags: [preflight]
+
+    # Mirrors the same guard in tasks/preflight_install.yml, which this
+    # playbook deliberately does not include (its preflight is restore-
+    # specific). socket_proxy_image was added to all.yml.example after the
+    # initial release and is consumed unguarded by docker-compose.yml.j2, so
+    # an all.yml predating it would fail at render_config.yml - which here
+    # means failing partway through a DISASTER RECOVERY, after setup_host.yml
+    # has already installed Docker on the replacement host.
+    - name: Assert all.yml has the variables this playbook renders
+      ansible.builtin.assert:
+        that:
+          - socket_proxy_image is defined
+        fail_msg: >-
+          group_vars/all.yml is missing socket_proxy_image. Copy it across
+          from all.yml.example (it pins the Docker socket proxy) before
+          restoring - docker-compose.yml cannot be rendered without it.
       tags: [preflight]
 
     - name: Create a local staging directory for the decrypted backup

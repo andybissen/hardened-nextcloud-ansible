@@ -9,7 +9,13 @@
 # --- Site-specific: you MUST set these ---
 hostname: nc.example.com                 # the public FQDN this instance serves
 acme_email: admin@example.com            # Let's Encrypt registration/expiry email
-nextcloud_admin_user: admin
+# Deliberately NOT "admin". A valid username is half the credential pair,
+# and any default shipped here is one this repo hands an attacker for free
+# before they guess anything - so pick something non-obvious. Note this is
+# only read when Nextcloud FIRST installs itself; changing it on an
+# already-deployed instance does not rename the existing account - that
+# takes an `occ user:add`/`user:disable` pass against the running container.
+nextcloud_admin_user: REPLACE_WITH_YOUR_ADMIN_USERNAME
 compose_dir: /opt/docker-conf
 
 network_subnet: 172.28.0.0/16
@@ -19,6 +25,14 @@ traefik_image: "traefik:v3.7"
 traefik_memory_limit: "512m"
 traefik_cpus: "1.0"
 
+# Pinned to a release tag rather than "latest": this is the only container
+# with any access to the Docker socket, so it's the worst place to let a
+# tag silently jump a major and shift the proxy's defaults. Unlike the
+# floating pins below this is an EXACT release, so a force-pull never moves
+# it - check-updates.py reports it (release check only; upstream has no
+# endoflife.date cycle and the container can't report its own version to
+# --live) so an available update can't go unnoticed.
+socket_proxy_image: "tecnativa/docker-socket-proxy:v0.5.0"
 socket_proxy_memory_limit: "128m"
 socket_proxy_cpus: "0.25"
 postgres_image: "postgres:18-trixie"
