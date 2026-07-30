@@ -15,14 +15,15 @@ Three things get reported for each image, because they call for different
 responses:
 
   - "latest patch under your pin" is informational by itself. Postgres/
-    Valkey are major-pinned and Traefik is minor-pinned (see
-    docs/maintenance.md), so newer patches within that pin are picked up
-    automatically the next time you force-pull - nothing to edit. Whether
-    you're actually behind it is a separate question - see --live below.
+    Valkey are major-pinned and Traefik is minor-pinned, so newer patches
+    within that pin need no edit - only a pull. socket-proxy is pinned to an
+    exact release, so this row just restates the pin and nothing arrives
+    under it. Whether you're actually behind is a separate question - see
+    --live below.
   - "newer line available" means a tag beyond your current pin boundary
-    exists (a new Traefik minor, or a new Postgres/Nextcloud/Valkey major).
-    That's the signal to make a deliberate decision - edit group_vars/all.yml
-    and follow the relevant upgrade doc. It is never applied automatically.
+    exists (a new Traefik minor, a new Postgres/Nextcloud/Valkey major, or a
+    new socket-proxy minor - its line is 0.x). That's the signal to make a
+    deliberate decision. It is never applied automatically.
   - "deployed" (only with --live) is what's actually running on the VPS
     right now, fetched by running check-deployed-versions.yml over SSH via
     your inventory.ini. Without this, the script has no way to know if a
@@ -31,6 +32,12 @@ responses:
     tag on its own, only an explicit `docker compose pull` does. This is
     the one part of the script that touches the VPS, which is why it's
     opt-in rather than the default.
+
+What to actually DO about any of the above is deliberately not spelled out
+here or in the report: what closes the gap differs per pin (a pull for a
+floating tag, a playbook re-run for an exact one). docs/maintenance.md is the
+single source for that, and the report points there rather than repeating
+advice that would be wrong for some images.
 
 Exit status: 0 if nothing needs attention, 1 if a newer line is available,
 an EOL date has passed or is coming up within EOL_WARN_DAYS, and/or (with
@@ -47,9 +54,9 @@ Limitations, so the report isn't over-trusted:
     the pin here floats at the major (9-alpine). The EOL shown is for
     whichever minor is currently newest under that major, since that's
     what's actually running at any given time.
-  - Not every image supports every column. socket-proxy has no EOL data
-    upstream and no way to report its own version from inside the
-    container, so it gets the release check only - see its IMAGES entry.
+  - Not every image supports every column: socket-proxy has no EOL data
+    upstream, so it gets no EOL row. Both eol_slug and deployed_task are
+    optional per-image - see the IMAGES entries.
 """
 
 import argparse
@@ -100,20 +107,26 @@ IMAGES = [
         "deployed_regex": r"Version:\s*v?([\d.]+)",
     },
     {
-        # Release-check only, deliberately. endoflife.date tracks no cycle
-        # for this project, and the container is HAProxy-based with no
-        # command that reports the proxy's OWN release (haproxy -v gives
-        # HAProxy's version, not v0.5.0), so there's nothing for --live to
-        # probe. Listed here anyway because this is the one image pinned to
-        # an exact release: it never picks anything up from a force-pull, so
-        # without a release check it would silently rot. Note its version
-        # line is 0.x, where new releases bump the MINOR - "newer line
-        # available" is therefore the signal to watch here, not a new major.
+        # No eol_slug: endoflife.date tracks no cycle for this project.
+        #
+        # The deployed version comes from the OCI image label rather than a
+        # command inside the container - it's HAProxy-based, so `haproxy -v`
+        # reports HAProxy's version, not the proxy's own release. See the
+        # "Check socket-proxy version" task in check-deployed-versions.yml,
+        # which dumps `docker inspect` JSON for this regex to read.
+        #
+        # Worth having --live here even though the pin is exact: an exact pin
+        # can't drift on a force-pull, but it CAN differ from what's running
+        # if all.yml was bumped and the playbook never re-run. Note the
+        # version line is 0.x, where releases bump the MINOR - so "newer line
+        # available" is the signal to watch, not a new major.
         "label": "socket-proxy",
         "var": "socket_proxy_image",
         "hub_repo": "tecnativa/docker-socket-proxy",
         "prefix": "v",
         "suffix": "",
+        "deployed_task": "check socket-proxy version",
+        "deployed_regex": r'org\.opencontainers\.image\.version":\s*"v?([\d.]+)"',
     },
     {
         "label": "Postgres",
@@ -230,6 +243,20 @@ def fetch_tag_versions(image: dict, pin_numbers: tuple[int, ...]) -> dict[tuple[
     return versions
 
 
+def today_utc():
+    """Today's date in UTC.
+
+    Deliberately not date.today(), which is local: every date this script
+    compares against comes from an upstream API in UTC - Docker Hub's
+    last_updated, and endoflife.date's cycle dates. Mixing a local "today"
+    with a UTC "then" puts the two out of step by up to a day depending on
+    the operator's timezone, which is enough to report something pushed
+    minutes ago as "1 day ago" (or vice versa). Also what Ruff's DTZ011
+    flags.
+    """
+    return datetime.datetime.now(datetime.timezone.utc).date()
+
+
 def release_age(date_str):
     """'released 2026-07-15 (2 days ago)', or '' if no date is available -
     lets the reader judge whether a flagged update is fresh enough that
@@ -240,7 +267,7 @@ def release_age(date_str):
         release_date = datetime.date.fromisoformat(date_str)
     except ValueError:
         return ""
-    days = (datetime.date.today() - release_date).days
+    days = (today_utc() - release_date).days
     if days <= 0:
         age = "today"
     elif days == 1:
@@ -273,6 +300,13 @@ def fetch_deployed_stdout():
         result = subprocess.run(
             ["ansible-playbook", "-i", str(INVENTORY), str(DEPLOYED_VERSIONS_PLAYBOOK)],
             capture_output=True, text=True, timeout=60, env=env,
+            # Explicit (Ruff PLW1510), and load-bearing rather than just
+            # silencing the rule: a non-zero exit is EXPECTED here. Every
+            # task in that playbook uses ignore_errors, so one missing or
+            # unreachable container still lets the rest report - and the
+            # json callback emits parseable output either way. Raising on
+            # exit status would throw away a perfectly good partial result.
+            check=False,
         )
         data = json.loads(result.stdout)
     except (subprocess.SubprocessError, OSError, json.JSONDecodeError) as e:
@@ -330,7 +364,7 @@ def format_eol(entries, cycle_candidates):
             if eol in (False, None):
                 return label, "not yet announced", False
             eol_date = datetime.date.fromisoformat(eol)
-            days = (eol_date - datetime.date.today()).days
+            days = (eol_date - today_utc()).days
             if days < 0:
                 return label, f"{eol} - ⚠ ALREADY END-OF-LIFE", True
             if days <= EOL_WARN_DAYS:
@@ -381,10 +415,12 @@ def main():
         print(image["label"])
         row("pinned", pin)
 
-        # Informational by itself: the pin (e.g. "v3.7", "18-trixie") is a
-        # floating alias, so a plain force-pull always fetches whichever
-        # patch is newest under it - there's nothing to compare without
-        # knowing what's actually deployed, which is what --live is for.
+        # Informational by itself: most pins here (e.g. "v3.7", "18-trixie")
+        # are floating aliases, so whichever patch is newest under them is
+        # what a pull fetches - there's nothing to compare without knowing
+        # what's actually deployed, which is what --live is for. For an exact
+        # pin like socket-proxy's this row just restates the pin, and --live
+        # is what shows whether the container was ever rebuilt onto it.
         if latest_within:
             tag_str = image["prefix"] + ".".join(str(n) for n in latest_within) + image["suffix"]
             row("latest under this pin", tag_str)
@@ -405,8 +441,15 @@ def main():
                 latest_str = ".".join(str(n) for n in latest_within)
                 age = release_age(versions.get(latest_within, ""))
                 age_suffix = f", {age}" if age else ""
-                row("⚠ deployed", f"{deployed_str} - behind the latest {latest_str}{age_suffix}; "
-                                   f"force-pull to update (see docs/maintenance.md)")
+                # Deliberately not naming a remedy here. What actually closes
+                # the gap depends on the pin: a floating tag needs a
+                # force-pull, an exact one (socket-proxy) needs a playbook
+                # re-run to recreate the container. docs/maintenance.md is
+                # the single place that distinction is spelled out, so point
+                # there rather than hardcoding advice that's wrong for one of
+                # the five images.
+                row("⚠ deployed", f"{deployed_str} - behind the latest {latest_str}{age_suffix}"
+                                   f"  -> see docs/maintenance.md to update")
                 attention_needed = True
             else:
                 row("deployed", f"{'.'.join(str(n) for n in deployed)}  (up to date)")

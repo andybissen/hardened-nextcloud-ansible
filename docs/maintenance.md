@@ -102,6 +102,9 @@ So there are two distinct operations:
 | The latest content **within** the current pin (patches, and minors for a major-pinned tag) | **Force-pull** the current tag (below) |
 | To **cross** the pin boundary (a new minor/major tag string) | Edit the tag in `group_vars/all.yml`, then re-run `playbook.yml` |
 
+socket-proxy is pinned to an exact release, so only the second row ever
+applies to it — a force-pull has nothing newer to fetch behind that tag.
+
 ### Force-pull recipe
 
 ```bash
@@ -282,10 +285,3 @@ docker exec -u www-data nextcloud_app php occ config:system:set log_type --value
 
 `alpine:latest` (backup/restore helpers) still floats on `latest`. That's
 acceptable — those helpers are ephemeral and hold no state.
-
-The socket-proxy is no longer among them: it's pinned via `socket_proxy_image`
-in `all.yml` and reported by `check-updates.py` alongside everything else —
-release check only, since upstream has no endoflife.date cycle and the
-container exposes no way to report its own version to `--live`. Because it's
-an exact release rather than a floating tag, nothing ever reaches it via a
-force-pull: watch for **newer line available** and bump the pin deliberately.

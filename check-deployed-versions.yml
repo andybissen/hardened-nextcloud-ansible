@@ -51,6 +51,22 @@
       register: nextcloud_version
       ignore_errors: true
 
+    # The odd one out: every other service reports its version from INSIDE
+    # the container, but this one can't. It's HAProxy-based, so `haproxy -v`
+    # gives HAProxy's version (3.4.2), not the proxy project's own release.
+    # The release is carried as an OCI image label instead, which is why this
+    # reads container metadata via the docker CLI rather than exec'ing.
+    #
+    # No --format here deliberately: Go template syntax is {{ }}, which
+    # Ansible would try to interpolate as Jinja. Dumping the whole JSON and
+    # letting check-updates.py's deployed_regex pick the label out avoids
+    # escaping it.
+    - name: Check socket-proxy version
+      ansible.builtin.command: docker inspect socket_proxy
+      register: socket_proxy_version
+      changed_when: false
+      ignore_errors: true
+
     - name: Report deployed versions
       ansible.builtin.debug:
         msg:
@@ -58,3 +74,9 @@
           - "Postgres:  {{ postgres_version.stdout | default('could not determine') }}"
           - "Valkey:    {{ valkey_version.stdout | default('could not determine') }}"
           - "Nextcloud: {{ nextcloud_version.stdout | default('could not determine') }}"
+          # Just the label, not the whole inspect payload - the raw JSON is
+          # for check-updates.py's regex, not for a human-readable report.
+          - >-
+            socket-proxy: {{ socket_proxy_version.stdout
+            | default('') | regex_search('org\.opencontainers\.image\.version":\s*"([^"]+)"', '\1')
+            | default(['could not determine'], true) | first }}

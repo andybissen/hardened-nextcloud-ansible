@@ -29,9 +29,8 @@ traefik_cpus: "1.0"
 # with any access to the Docker socket, so it's the worst place to let a
 # tag silently jump a major and shift the proxy's defaults. Unlike the
 # floating pins below this is an EXACT release, so a force-pull never moves
-# it - check-updates.py reports it (release check only; upstream has no
-# endoflife.date cycle and the container can't report its own version to
-# --live) so an available update can't go unnoticed.
+# it - check-updates.py tracks it (no EOL row; upstream has no
+# endoflife.date cycle) so an available update can't go unnoticed.
 socket_proxy_image: "tecnativa/docker-socket-proxy:v0.5.0"
 socket_proxy_memory_limit: "128m"
 socket_proxy_cpus: "0.25"
