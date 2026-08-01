@@ -121,7 +121,12 @@ before relying on any of it:
   itself can always read file content in the clear. SSE-C is a storage-layer
   protection, not a guarantee the operator can't see your data (unlike
   Nextcloud's own E2EE app, unused here). Expected and fine for most
-  self-hosters, but worth stating.
+  self-hosters, but worth stating. Nextcloud's own [encryption
+  documentation](https://docs.nextcloud.com/server/latest/admin_manual/configuration_files/encryption_configuration.html)
+  is the authority on where each mode's protection stops — including that
+  server-side encryption "does not protect data from a compromised Nextcloud
+  server or malicious administrator", and that E2EE is what to reach for if
+  that is your threat model.
 
 - **Local storage gets no built-in encryption, deliberately.** If you use
   local storage instead of S3, this repo does not enable Nextcloud's
