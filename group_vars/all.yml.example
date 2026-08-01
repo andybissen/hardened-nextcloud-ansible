@@ -146,6 +146,27 @@ backup_retention_count: 8
 # vars map to):
 # https://docs.nextcloud.com/server/stable/admin_manual/configuration_files/primary_storage.html
 
+# --- Optional: restrict admin actions to trusted IP ranges ---
+# Sets Nextcloud's own allowed_admin_ranges (see its Hardening guide). Admins
+# connecting from outside these ranges can still USE Nextcloud normally -
+# only admin-specific actions are hidden and refused. `occ` is unaffected
+# either way, so a wrong value locks nobody out permanently: fix all.yml and
+# re-run, or clear it directly with
+#   docker exec nextcloud_app php occ config:system:delete allowed_admin_ranges
+#
+# Give your own PUBLIC address or VPN range, NOT the private ranges shown in
+# Nextcloud's documentation - those examples assume Nextcloud is reached
+# directly on a LAN. Here it sits behind Traefik, and because TRUSTED_PROXIES
+# is set (see docker-compose.yml.j2) Nextcloud resolves the real client IP
+# from the forwarded headers rather than seeing the proxy's container IP. So
+# the value to match is the address you actually browse from.
+#
+# CIDR notation is required (preflight asserts it) - a bare IP silently
+# matches nothing. Leave commented out to apply no restriction at all.
+# nextcloud_allowed_admin_ranges:
+#   - "203.0.113.4/32"
+#   - "2001:db8:1234::/48"
+
 # --- Optional: outgoing email (SMTP) ---
 # Disabled by default (nothing renders, no secret file needed). Without it,
 # Nextcloud cannot send ANY email - password resets, share invitations,
