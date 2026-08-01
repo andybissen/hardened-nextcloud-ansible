@@ -10,11 +10,70 @@ name: nextcloud
 x-logging: &default-logging
   driver: journald
 
+# Container runtime confinement for the services whose attacker-reachable
+# process is NOT uid 0 (Apache workers run as www-data, Postgres as postgres,
+# Valkey as valkey). There, no-new-privileges is the load-bearing half: it
+# blocks the setuid-binary route from the unprivileged process to container
+# root, which is what makes the capability set reachable in the first place.
+#
+# A denylist rather than `cap_drop: [ALL]` + a rediscovered allowlist,
+# deliberately: no image documents which capabilities its entrypoint needs,
+# so the allowlist can only be found by breaking things, and it can change
+# under a routine image bump - turning a security setting into a container
+# that won't start after an update. Everything dropped here is unused by an
+# Apache/PHP, Postgres or Valkey process, and a wrong guess fails one
+# operation instead of the whole container. The caps these images do need
+# (CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, NET_BIND_SERVICE, KILL - the
+# entrypoints chown their data dirs, drop privileges via gosu/su-exec, and
+# Apache's root master signals its www-data workers) are left in place.
+#
+# NET_RAW is the one that matters most: it is the only capability here that
+# neither the host's SELinux container confinement nor Docker's default
+# seccomp profile already covers, and it is what would let one compromised
+# container ARP/DNS-spoof the others across the shared `web` and `db_net`
+# bridges. Side effect worth knowing before debugging inside a container:
+# raw sockets are gone, so anything packet-level (tcpdump, and `ping` in the
+# Alpine-based valkey image - the Debian-based images ship no ping at all)
+# stops working. Verify the drop actually applied with
+# `docker exec <name> grep CapBnd /proc/1/status`: 00000000a80425fb is
+# Docker's untouched default, 00000000000004eb is this denylist applied.
+x-hardening: &default-hardening
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - NET_RAW
+    - MKNOD
+    - SYS_CHROOT
+    - AUDIT_WRITE
+    - SETFCAP
+    - SETPCAP
+    - FSETID
+
 services:
   socket-proxy:
     image: {{ socket_proxy_image }}
     container_name: socket_proxy
     restart: always
+    # Full drop rather than the x-hardening denylist, because this image
+    # never drops privileges: its Dockerfile sets `USER root` explicitly
+    # (overriding the haproxy base image's `USER haproxy`) and the shipped
+    # haproxy.cfg has no user/group directive. So the process an attacker
+    # reaches is already uid 0 - there is no escalation step for
+    # no-new-privileges to block, and the capability set is live from the
+    # first request. Confirmed against the pinned v0.5.0, not master.
+    #
+    # No cap_add is needed: it binds 2375 (above 1024, so no
+    # NET_BIND_SERVICE), and everything it writes at runtime is root-owned
+    # (/tmp/haproxy.cfg from the entrypoint's sed, /run/haproxy.pid). Note
+    # that dropping ALL takes DAC_OVERRIDE away from uid 0 too - root's
+    # permission bypass IS that capability - which matters for exactly one
+    # path: /var/lib/haproxy/server-state is owned by uid 99 from the base
+    # image, and is only ever read here (mode 644, so readable anyway).
+    # If a future version starts writing it, DAC_OVERRIDE is the cap to add.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     networks:
       - socket_proxy_net
     mem_limit: {{ socket_proxy_memory_limit }}
@@ -38,6 +97,18 @@ services:
     restart: always
     depends_on:
       - socket-proxy
+    # Full drop for the same reason as socket-proxy: the official Traefik
+    # image has no USER directive, so this runs as uid 0 with the whole
+    # default capability set already held by the process that terminates
+    # TLS for the internet. NET_BIND_SERVICE has to be added back because
+    # cap_drop takes it from root as well - without it, binding :80/:443
+    # below fails at startup.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
     networks:
       - web
       - socket_proxy_net
@@ -75,6 +146,7 @@ services:
     image: {{ postgres_image }}
     container_name: pg_db
     restart: always
+    <<: *default-hardening
     networks:
       - db_net
     mem_limit: {{ postgres_memory_limit }}
@@ -127,6 +199,7 @@ services:
     image: {{ valkey_image }}
     container_name: valkey
     restart: always
+    <<: *default-hardening
     networks:
       - db_net
     mem_limit: {{ valkey_memory_limit }}
@@ -163,6 +236,7 @@ services:
     image: {{ nextcloud_image }}
     container_name: nextcloud_app
     restart: always
+    <<: *default-hardening
     depends_on:
       postgres:
         condition: service_healthy
@@ -295,6 +369,7 @@ services:
     image: {{ nextcloud_image }}
     container_name: nextcloud_cron
     restart: always
+    <<: *default-hardening
     entrypoint: /cron.sh
     depends_on:
       postgres:
