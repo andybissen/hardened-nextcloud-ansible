@@ -8,6 +8,13 @@
 group_vars/vault.yml
 group_vars/all.yml
 inventory.ini
+# Parked copies of the above. The patterns are exact filenames, so renaming
+# vault.yml out of the way (to swap in a test config, say) silently drops it
+# back into git's view - as an untracked file that `git add -A` would happily
+# stage. An encrypted vault.yml must never be committed either, so the
+# rename must not be what un-ignores it.
+group_vars/*.orig*
+group_vars/*.bak
 
 # Your actual backup-encryption public key (generate your own; see
 # files/backup_public_key.asc.README). The .README stays tracked.
