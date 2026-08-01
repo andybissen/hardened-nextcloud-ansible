@@ -196,7 +196,7 @@ a full deploy, `ansible-playbook rescan-images.yml` (see
 ssh root@nc.example.com 'docker ps'
 
 # Nextcloud should report installed:
-ssh root@nc.example.com 'docker exec -u www-data nextcloud_app php occ status'
+ssh root@nc.example.com 'docker exec nextcloud_app php occ status'
 ```
 
 Then browse to **https://nc.example.com** and log in with

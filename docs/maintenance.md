@@ -276,7 +276,7 @@ so a restored or migrated instance already carries it). If you're on an
 existing install from before this was added, set it once by hand:
 
 ```bash
-docker exec -u www-data nextcloud_app php occ config:system:set log_type --value=errorlog
+docker exec nextcloud_app php occ config:system:set log_type --value=errorlog
 ```
 
 ---

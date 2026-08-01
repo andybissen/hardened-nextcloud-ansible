@@ -54,6 +54,13 @@
   loop_control:
     index_var: range_index
     label: "{{ item }}"
+  register: admin_range_set
+  # docker_container_exec reports rc but does NOT fail the task on a non-zero
+  # one, so without this an occ that refused to run would leave the play green
+  # and the restriction silently unapplied - the exact failure mode this
+  # control must not have. Same reason the two tasks in playbook.yml wrap
+  # their occ calls in `until: rc == 0`.
+  failed_when: admin_range_set.rc != 0
   when:
     - nextcloud_allowed_admin_ranges is defined
     - nextcloud_allowed_admin_ranges | length > 0
@@ -67,6 +74,8 @@
   loop: >-
     {{ range(nextcloud_allowed_admin_ranges | length,
              admin_ranges_existing | length) | list | reverse | list }}
+  register: admin_range_trim
+  failed_when: admin_range_trim.rc != 0
   when:
     - nextcloud_allowed_admin_ranges is defined
     - nextcloud_allowed_admin_ranges | length > 0
@@ -80,6 +89,8 @@
   community.docker.docker_container_exec:
     container: nextcloud_app
     command: php occ config:system:delete allowed_admin_ranges
+  register: admin_range_clear
+  failed_when: admin_range_clear.rc != 0
   when: >-
     nextcloud_allowed_admin_ranges is not defined
     or nextcloud_allowed_admin_ranges | length == 0

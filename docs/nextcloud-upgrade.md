@@ -134,7 +134,7 @@ ansible-playbook nextcloud-upgrade.yml --ask-vault-pass -e nextcloud_target_tag=
 ## Verify
 
 ```bash
-ssh root@nc.example.com 'docker exec -u www-data nextcloud_app php occ status'
+ssh root@nc.example.com 'docker exec nextcloud_app php occ status'
 ```
 
 Confirm the reported `versionstring` matches the major you targeted, then

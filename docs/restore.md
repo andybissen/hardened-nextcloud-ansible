@@ -107,7 +107,7 @@ requested. DNS must resolve for that to succeed.
 ## Verify
 
 ```bash
-ssh root@<new-host> 'docker exec -u www-data nextcloud_app php occ status'
+ssh root@<new-host> 'docker exec nextcloud_app php occ status'
 ```
 
 Confirm `installed: true` and the expected `versionstring`, then browse to
