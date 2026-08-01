@@ -28,6 +28,16 @@ things an assistant would otherwise have to rediscover the hard way.
   not cosmetic — `conf.d`/`conf-enabled` load alphabetically, and `z-`
   guarantees these load after the image's own stock files (which otherwise
   silently win). Preserve this convention for any new custom config file.
+- **The capability denylist on postgres/valkey/nextcloud/cron is deliberate,
+  not a half-finished `cap_drop: [ALL]`.** Those four keep the caps their
+  entrypoints need (chown of data dirs, `gosu`/`su-exec` privilege drop,
+  Apache's root master signalling www-data workers) because no image
+  documents that set — it can only be found by breaking things, and it can
+  change under a routine image bump. Tightening them to `ALL` + an allowlist
+  is a real option, but it needs a live deploy to validate, so don't do it as
+  a drive-by consistency fix with Traefik and the socket proxy (which *do*
+  drop everything, because they run as uid 0 with no escalation step to
+  block). See the `x-hardening` comment in the compose template.
 - **`vault_valkey_password` must stay alphanumeric only.** It's templated
   unescaped into a `requirepass` config line (`requirepass {{ ... }}`), and
   at runtime it's `cat`'d from its secret file onto a `valkey-cli -a` shell

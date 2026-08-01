@@ -25,6 +25,9 @@ Highlights:
 - **A minimal-privilege Docker API surface** — Traefik only ever talks to a
   read-only, whitelisted socket proxy; nothing here has broad Docker socket
   access.
+- **Confined container runtimes** — `no-new-privileges` on every service,
+  capabilities dropped everywhere (all of them on Traefik and the socket
+  proxy, which run as root), on top of Docker's SELinux confinement.
 
 ## Why does this exist?
 
