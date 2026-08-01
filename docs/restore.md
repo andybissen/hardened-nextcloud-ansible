@@ -83,7 +83,14 @@ it finds no existing `version.php`. To avoid racing that, the playbook:
 9. **Brings up the full stack** — now Nextcloud sees an existing
    `version.php` and takes the upgrade-check path instead of a fresh install.
 10. **Waits** for `occ status` to report `installed: true` and prints it.
-11. **Cleans up** the local decrypted staging directory.
+11. **Re-applies `nextcloud_allowed_admin_ranges`** from `all.yml`, if you use
+    it — the backed-up `config.php` carries whatever range was current when
+    the backup was taken, which may no longer be the address you administer
+    from. `all.yml` wins, not the backup. If you do end up locked out of
+    admin actions (you can still use Nextcloud normally; only admin-specific
+    actions are hidden), clear it directly:
+    `docker exec nextcloud_app php occ config:system:delete allowed_admin_ranges`
+12. **Cleans up** the local decrypted staging directory.
 
 ---
 

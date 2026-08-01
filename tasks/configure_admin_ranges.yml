@@ -1,0 +1,85 @@
+---
+# Converges Nextcloud's allowed_admin_ranges to whatever
+# nextcloud_allowed_admin_ranges says in all.yml (unset/empty = no
+# restriction). Shared by playbook.yml and restore.yml rather than living in
+# either: unlike maintenance_window_start and log_type - which restore.yml
+# deliberately leaves to the restored config.php, since their correct value
+# never drifts - this one CAN go stale in a backup. Change your admin IP,
+# update all.yml, then restore an older backup and the archived config.php
+# silently reimposes the old range, hiding every admin action at the exact
+# moment you are least equipped to debug it.
+#
+# Ordering is load-bearing. The obvious "delete the key, then re-add each
+# entry" is fail-open: between the two, and after any interruption or a
+# failure partway through the loop, the instance has NO restriction and
+# nothing says so. That inverts the rule the destructive playbooks in this
+# repo follow (never drop the last known-good copy until its replacement is
+# verified). So entries are written FIRST and only the stale tail is removed
+# afterward. allowed_admin_ranges is an allowlist, so a tail that briefly
+# outlives its replacement is more permissive than intended but still a
+# restriction - never the wide-open window a leading delete creates.
+#
+# Values are passed one plain token per occ call rather than as a single
+# --value='["a","b"]' JSON array: that would have to survive Ansible's
+# quoting, docker exec's argv handling, and the shell, for no gain.
+
+- name: Read the current admin IP range restriction
+  community.docker.docker_container_exec:
+    container: nextcloud_app
+    command: php occ config:system:get allowed_admin_ranges --output json
+  register: admin_ranges_current
+  # rc 1 simply means the key is unset (a fresh install, or a deployment that
+  # never opted in), which is a normal state here rather than an error.
+  failed_when: false
+  changed_when: false
+
+# `rc | default(1)` rather than a bare .rc: if nextcloud_app does not exist at
+# all the module fails without ever setting rc, and failed_when: false above
+# turns that into a result with no rc key rather than a play failure. Treating
+# that as "nothing configured" is right - there is no instance to converge.
+- name: Note which admin IP ranges are currently set
+  ansible.builtin.set_fact:
+    admin_ranges_existing: >-
+      {{ (admin_ranges_current.stdout | default('[]', true) | trim | from_json)
+         if (admin_ranges_current.rc | default(1)) == 0
+         else [] }}
+
+- name: Restrict admin actions to the configured IP ranges
+  community.docker.docker_container_exec:
+    container: nextcloud_app
+    command: >-
+      php occ config:system:set allowed_admin_ranges {{ range_index }}
+      --value={{ item }}
+  loop: "{{ nextcloud_allowed_admin_ranges }}"
+  loop_control:
+    index_var: range_index
+    label: "{{ item }}"
+  when:
+    - nextcloud_allowed_admin_ranges is defined
+    - nextcloud_allowed_admin_ranges | length > 0
+
+# Descending, so each delete cannot shift the index of one still to come -
+# true whether or not Nextcloud re-indexes the array on removal.
+- name: Remove admin IP range entries left over from a longer previous list
+  community.docker.docker_container_exec:
+    container: nextcloud_app
+    command: php occ config:system:delete allowed_admin_ranges {{ item }}
+  loop: >-
+    {{ range(nextcloud_allowed_admin_ranges | length,
+             admin_ranges_existing | length) | list | reverse | list }}
+  when:
+    - nextcloud_allowed_admin_ranges is defined
+    - nextcloud_allowed_admin_ranges | length > 0
+    - admin_ranges_existing | length > nextcloud_allowed_admin_ranges | length
+
+# The one case where removing the restriction outright IS the intent, so
+# there is no fail-open concern: the operator took the variable back out of
+# all.yml. config:system:delete on an absent key is a no-op unless
+# --error-if-not-exists is passed, so this is safe when it was never set.
+- name: Clear the admin IP range restriction when none is configured
+  community.docker.docker_container_exec:
+    container: nextcloud_app
+    command: php occ config:system:delete allowed_admin_ranges
+  when: >-
+    nextcloud_allowed_admin_ranges is not defined
+    or nextcloud_allowed_admin_ranges | length == 0

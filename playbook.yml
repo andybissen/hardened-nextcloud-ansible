@@ -100,32 +100,9 @@
 
     # Optional admin IP restriction (nextcloud_allowed_admin_ranges in
     # all.yml - commented out by default, see all.yml.example for why the
-    # value is your public address rather than a private range).
-    #
-    # Cleared first, unconditionally, so this stays declarative in both
-    # directions: removing the variable from all.yml actually removes the
-    # restriction, and a shortened list can't leave a stale higher index
-    # behind (occ sets array entries by position, it does not replace the
-    # whole array). config:system:delete on an absent key is a no-op unless
-    # --error-if-not-exists is passed, so this is safe when it was never set.
-    #
-    # No retry loop, unlike the two tasks above: occ is already proven usable
-    # by the time those have succeeded.
-    - name: Clear any existing admin IP range restriction
-      community.docker.docker_container_exec:
-        container: nextcloud_app
-        command: php occ config:system:delete allowed_admin_ranges
-
-    - name: Restrict admin actions to the configured IP ranges
-      community.docker.docker_container_exec:
-        container: nextcloud_app
-        command: >-
-          php occ config:system:set allowed_admin_ranges {{ range_index }}
-          --value={{ item }}
-      loop: "{{ nextcloud_allowed_admin_ranges }}"
-      loop_control:
-        index_var: range_index
-        label: "{{ item }}"
-      when:
-        - nextcloud_allowed_admin_ranges is defined
-        - nextcloud_allowed_admin_ranges | length > 0
+    # value is your public address rather than a private range). Shared with
+    # restore.yml, which needs to converge it for the reasons in the include.
+    # No retry loop needed around it, unlike the two tasks above: occ is
+    # already proven usable by the time those have succeeded.
+    - name: Converge the optional admin IP range restriction
+      ansible.builtin.include_tasks: tasks/configure_admin_ranges.yml

@@ -399,6 +399,15 @@
         container: nextcloud_app
         command: php occ maintenance:mode --off
 
+    # Deliberately re-applied on restore, unlike maintenance_window_start and
+    # log_type (which playbook.yml sets once and the restored config.php
+    # carries forward correctly). This one can be stale in a backup: if your
+    # admin IP changed and you updated all.yml, the archived config.php would
+    # otherwise reimpose the old range and hide every admin action just as you
+    # come back up. all.yml is the source of truth for it, not the backup.
+    - name: Converge the optional admin IP range restriction
+      ansible.builtin.include_tasks: tasks/configure_admin_ranges.yml
+
     - name: Show the resulting Nextcloud status
       ansible.builtin.debug:
         var: occ_status.stdout_lines
