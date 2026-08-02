@@ -178,6 +178,14 @@
       community.docker.docker_container_exec:
         container: nextcloud_app
         command: php occ maintenance:mode --on
+      register: backup_maintenance_on
+      # Everything below depends on writes actually being paused, and
+      # docker_container_exec reports rc without failing on it. Unguarded,
+      # a refused switch-on silently produces a DB dump and an nc_data
+      # snapshot taken from a LIVE instance - an inconsistent pair that
+      # still looks like a successful backup and is only discovered at
+      # restore time, which is the worst possible moment to discover it.
+      failed_when: backup_maintenance_on.rc != 0
 
     - name: Snapshot the DB and data volume while writes are paused
       block:
@@ -213,6 +221,12 @@
           community.docker.docker_container_exec:
             container: nextcloud_app
             command: php occ maintenance:mode --off
+          register: backup_maintenance_off
+          # The always block guarantees this RUNS; checking rc is what
+          # guarantees it WORKED. Unguarded, a failed switch-off leaves the
+          # instance stuck read-only behind a green play - precisely the
+          # outcome the block/always structure exists to prevent.
+          failed_when: backup_maintenance_off.rc != 0
 
     - name: Archive the Traefik certs volume (acme.json + account key) to staging
       # Easy to overlook, but this holds the Let's Encrypt private key and

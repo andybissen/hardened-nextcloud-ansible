@@ -398,6 +398,11 @@
       community.docker.docker_container_exec:
         container: nextcloud_app
         command: php occ maintenance:mode --off
+      register: restore_maintenance_off
+      # Without this a refused switch-off leaves the restored site down
+      # behind a green play - and "Restore complete" is the last thing the
+      # operator reads before walking away from a recovery.
+      failed_when: restore_maintenance_off.rc != 0
 
     # Deliberately re-applied on restore, unlike maintenance_window_start and
     # log_type (which playbook.yml sets once and the restored config.php
