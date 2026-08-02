@@ -408,9 +408,28 @@
     - name: Converge the optional admin IP range restriction
       ansible.builtin.include_tasks: tasks/configure_admin_ranges.yml
 
+    # Re-read rather than reusing occ_status from the wait-for-installed task
+    # above: that was registered BEFORE maintenance mode was switched off, so
+    # printing it reported `maintenance: true` on a restore that had in fact
+    # already left maintenance mode. Misleading at the exact moment an
+    # operator is scanning the tail of a recovery for problems - and it hid
+    # the one thing this summary should confirm, since a silently failed
+    # maintenance:mode --off leaves the site down behind an otherwise green
+    # play.
+    - name: Re-read Nextcloud status now that maintenance mode is off
+      community.docker.docker_container_exec:
+        container: nextcloud_app
+        command: php occ status
+      register: occ_status_final
+      changed_when: false
+      # docker_container_exec does not fail on a non-zero rc, and a status
+      # read that fails here means something is wrong with an instance the
+      # play is about to declare restored.
+      failed_when: occ_status_final.rc != 0
+
     - name: Show the resulting Nextcloud status
       ansible.builtin.debug:
-        var: occ_status.stdout_lines
+        var: occ_status_final.stdout_lines
 
     - name: Clean up the local decrypted staging directory
       ansible.builtin.file:
