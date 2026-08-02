@@ -166,6 +166,9 @@ This will, in order:
 6. Render `docker-compose.yml`, the Traefik dynamic config, app config, and
    the file-based Docker secrets onto the host.
 7. Bring the whole stack up and pull images.
+8. Apply the config that only `occ` can set, once Nextcloud answers: the
+   maintenance window hour, routing Nextcloud's log through journald, and
+   `nextcloud_allowed_admin_ranges` if you set one.
 
 First boot takes a few minutes: Nextcloud runs its install routine, and
 Traefik requests the TLS certificate.

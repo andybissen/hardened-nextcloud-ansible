@@ -82,15 +82,22 @@ it finds no existing `version.php`. To avoid racing that, the playbook:
 8. **Deletes the plaintext staging** (dump + tarballs) from the VPS.
 9. **Brings up the full stack** — now Nextcloud sees an existing
    `version.php` and takes the upgrade-check path instead of a fresh install.
-10. **Waits** for `occ status` to report `installed: true` and prints it.
-11. **Re-applies `nextcloud_allowed_admin_ranges`** from `all.yml`, if you use
+10. **Waits** for `occ status` to report `installed: true`.
+11. **Switches maintenance mode off.** `backup.yml` snapshots `nc_data` while
+    the instance is in maintenance mode, so the archived `config.php` carries
+    it baked in — without this the site comes back up stuck read-only despite
+    `installed: true`.
+12. **Re-applies `nextcloud_allowed_admin_ranges`** from `all.yml`, if you use
     it — the backed-up `config.php` carries whatever range was current when
     the backup was taken, which may no longer be the address you administer
     from. `all.yml` wins, not the backup. If you do end up locked out of
     admin actions (you can still use Nextcloud normally; only admin-specific
     actions are hidden), clear it directly:
     `docker exec nextcloud_app php occ config:system:delete allowed_admin_ranges`
-12. **Cleans up** the local decrypted staging directory.
+13. **Re-reads and prints `occ status`.** Deliberately a second read — the one
+    from step 10 predates the maintenance switch-off, so printing it would
+    report `maintenance: true` on a perfectly healthy restore.
+14. **Cleans up** the local decrypted staging directory.
 
 ---
 
