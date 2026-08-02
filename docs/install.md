@@ -215,6 +215,12 @@ Then browse to **https://nc.example.com** and log in with
 > from the web UI is what makes that copy worthless. Nextcloud has no
 > force-change-on-first-login setting, so this is a step you have to take.
 
+Account security beyond that is deliberately left to Nextcloud's own settings
+rather than managed here — see its
+[password policy](https://docs.nextcloud.com/server/latest/admin_manual/configuration_user/user_password_policy.html)
+and [two-factor authentication](https://docs.nextcloud.com/server/latest/admin_manual/configuration_user/two_factor-auth.html)
+documentation.
+
 Optional TLS check — you should see an A+ with `X25519MLKEM768` listed
 first under key exchange:
 
