@@ -141,6 +141,21 @@ services:
       # the old certbot deployment used (default here would be RSA4096).
       - "--certificatesresolvers.myresolver.acme.keytype=EC384"
       - "--log.level=INFO"
+      # Apache in the nextcloud container already logs every request that
+      # REACHES it, with the real client IP (mod_remoteip + TRUSTED_PROXIES),
+      # into the same journal. What has no record at all is everything the
+      # proxy handles itself: requests the rate-limit middleware drops, TLS
+      # handshake failures, and SNI probes for other hostnames. During a
+      # credential-stuffing flood the rate limiter is doing the most
+      # interesting work and, without this, leaving no trace of it.
+      #
+      # Filtered to 4xx/5xx rather than logging everything: the security
+      # signal is entirely in the 401/403/429s, and journald retention here
+      # is host-wide (see journald-retention.conf.j2), so duplicating every
+      # successful request would just push the real signal out of the
+      # SystemMaxUse window faster.
+      - "--accesslog=true"
+      - "--accesslog.filters.statuscodes=400-599"
 
   postgres:
     image: {{ postgres_image }}

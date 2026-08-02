@@ -146,9 +146,25 @@
     mode: "0644"
   no_log: true
 
+# A bootstrap credential, not a standing one: the image's entrypoint reads it
+# exactly once, during `maintenance:install`, after which the account lives
+# hashed in Postgres. Resetting the admin password at first login (see
+# docs/install.md) is what makes the copy left in this file inert - it cannot
+# be scrubbed after the fact, because the file is bind-mounted into the
+# container by inode and ansible.builtin.copy replaces it by rename (see
+# AGENTS.md).
+#
+# Callers that can never install set render_real_admin_password: false and get
+# a random value instead. restore.yml is the case: it brings the stack up on
+# top of an already-restored nc_data, so the entrypoint always takes the
+# existing-instance path and the real password would only be dead weight
+# copied onto a new host.
 - name: Write the Nextcloud admin password to its secret file
   ansible.builtin.copy:
-    content: "{{ vault_nextcloud_admin_password }}"
+    content: >-
+      {{ vault_nextcloud_admin_password
+         if (render_real_admin_password | default(true))
+         else lookup('password', '/dev/null', length=40, chars=['ascii_letters', 'digits']) }}
     dest: "{{ compose_dir }}/secrets/nextcloud_admin_password"
     mode: "0644"
   no_log: true

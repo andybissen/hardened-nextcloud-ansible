@@ -10,6 +10,13 @@
 # vault passphrase. Keep these values in a password manager too.
 
 vault_postgres_password: "change-me-to-something-long-and-random"
+# Bootstrap credential only - Nextcloud's installer reads this once, then the
+# account lives in the database. Changing it here later does NOT change the
+# account, and the value stays readable inside the container at
+# /run/secrets/nextcloud_admin_password for the life of the deployment. Reset
+# the admin password from the web UI after first login (see docs/install.md);
+# that is what makes this copy inert. Generate something random rather than
+# reusing a password you use elsewhere.
 vault_nextcloud_admin_password: "change-me-too"
 # Keep this one ALPHANUMERIC - it is interpolated into a shell healthcheck,
 # so characters like $ " or \ would break the rendered compose file.

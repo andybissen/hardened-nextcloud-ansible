@@ -205,6 +205,16 @@ ssh root@nc.example.com 'docker exec nextcloud_app php occ status'
 Then browse to **https://nc.example.com** and log in with
 `nextcloud_admin_user` (from `all.yml`) and `vault_nextcloud_admin_password`.
 
+> **Change the admin password once you're in.** `vault_nextcloud_admin_password`
+> is a bootstrap credential: Nextcloud's installer reads it once and the
+> account then lives in the database, so changing it in `vault.yml` later has
+> no effect on the account. Meanwhile the value stays in
+> `/run/secrets/nextcloud_admin_password`, readable inside the container, for
+> as long as the deployment lives — and an RCE in Nextcloud or any app you
+> install lands as exactly the user who can read it. Resetting the password
+> from the web UI is what makes that copy worthless. Nextcloud has no
+> force-change-on-first-login setting, so this is a step you have to take.
+
 Optional TLS check — you should see an A+ with `X25519MLKEM768` listed
 first under key exchange:
 

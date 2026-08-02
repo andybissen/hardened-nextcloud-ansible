@@ -109,6 +109,28 @@ category:
    `check-updates.py` depends on). The inline comments at each call site
    record what that *particular* failure would cost, not this mechanism.
 
+## A secret file already mounted into a container cannot be rewritten in place
+
+Compose mounts each `secrets:` entry by bind-mounting the host file, and a
+bind-mounted *file* follows the **inode**, not the path.
+`ansible.builtin.copy` writes atomically — temp file plus `rename()` — so
+rewriting one of `secrets/*` gives the host path a new inode while the
+running container keeps reading the old one. The host file changes, `docker
+exec cat` shows the old value, and nothing errors.
+
+This was hit trying to scrub `secrets/nextcloud_admin_password` after
+install: the play went green, the host file held the new value, and the
+container still had the original (confirmed live via `stat` on the host
+versus `wc -c` inside the container). It cannot be made to work by ordering
+either, since `render_config.yml` rewrites secrets before every `compose up`,
+so a recreated container binds whatever was written then.
+
+If you ever genuinely need a mounted secret to change under a running
+container, `unsafe_writes: true` keeps the inode — but prefer not writing the
+value in the first place (see `render_real_admin_password` in
+`render_config.yml`) or making it inert another way (the admin password is
+reset from the web UI after first login; see `docs/install.md`).
+
 ## Comment style
 
 Comments in this repo explain **why**, not what — a hidden constraint, a

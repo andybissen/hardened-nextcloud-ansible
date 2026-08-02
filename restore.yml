@@ -253,8 +253,17 @@
     - name: Set up the host (Docker, firewalld, DOCKER-USER, journald)
       ansible.builtin.include_tasks: tasks/setup_host.yml
 
+    # render_real_admin_password: a restore can never trigger a first install
+    # - nc_data is restored before the stack comes up, so the entrypoint always
+    # finds an existing version.php and skips maintenance:install. The admin
+    # account comes back from the database dump with whatever password it had
+    # when the backup was taken, so vault_nextcloud_admin_password is not just
+    # unused here, it may not even be the right one. Writing a random value
+    # keeps the real password off the restore target entirely.
     - name: Render docker-compose.yml and app config
       ansible.builtin.include_tasks: tasks/render_config.yml
+      vars:
+        render_real_admin_password: false
 
     # --- Bring up only Postgres, and restore into it, before Nextcloud
     # ever gets a chance to see an empty database and auto-install ---
