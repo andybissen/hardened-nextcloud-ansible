@@ -57,7 +57,8 @@ things an assistant would otherwise have to rediscover the hard way.
   never suggest committing them, and never remove them from `.gitignore`.
   `vault.yml` must never be committed even in its Ansible-Vault-encrypted
   form (see the comment in `vault.yml.example` for why).
-- **Backups are not namespaced per deployment.** `remote_backup_dir` /
+- **Backups are not namespaced per deployment** (the operator-facing version
+  of this is in `docs/backup.md`). `remote_backup_dir` /
   `local_backup_dir` and `backup_retention_count` are shared, fixed paths —
   don't assume a backup's filename or location implies which instance
   produced it.
@@ -97,6 +98,16 @@ category:
    or `rc | default(1)` inline where a value is needed regardless (see the
    upgrade playbooks and `backup.yml`). Match whichever the surrounding
    tasks use.
+5. An explicit `rc` check on every `docker_container_exec` whose success
+   matters. The module reports `rc` but does **not** fail the task on a
+   non-zero one, so an unguarded command that refuses to run leaves a green
+   play and a job half-done — the failure mode is silence, not an error.
+   Guard with `until: <reg>.rc == 0` where the task should also wait and
+   retry, or `failed_when: <reg>.rc != 0` where it should just fail.
+   Deliberate exceptions carry `ignore_errors`/`failed_when: false` and a
+   comment saying why (see `check-deployed-versions.yml`, whose tolerance
+   `check-updates.py` depends on). The inline comments at each call site
+   record what that *particular* failure would cost, not this mechanism.
 
 ## Comment style
 

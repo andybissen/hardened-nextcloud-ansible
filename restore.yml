@@ -399,9 +399,9 @@
         container: nextcloud_app
         command: php occ maintenance:mode --off
       register: restore_maintenance_off
-      # Without this a refused switch-off leaves the restored site down
-      # behind a green play - and "Restore complete" is the last thing the
-      # operator reads before walking away from a recovery.
+      # A refused switch-off leaves the restored site down, and "Restore
+      # complete" is the last thing the operator reads before walking away
+      # from a recovery.
       failed_when: restore_maintenance_off.rc != 0
 
     # Deliberately re-applied on restore, unlike maintenance_window_start and
@@ -427,9 +427,8 @@
         command: php occ status
       register: occ_status_final
       changed_when: false
-      # docker_container_exec does not fail on a non-zero rc, and a status
-      # read that fails here means something is wrong with an instance the
-      # play is about to declare restored.
+      # A status read that fails here means something is wrong with an
+      # instance the play is about to declare restored.
       failed_when: occ_status_final.rc != 0
 
     - name: Show the resulting Nextcloud status

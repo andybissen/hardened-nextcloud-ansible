@@ -145,11 +145,9 @@
     # admin to run afterward rather than blocking the upgrade on them. Both
     # are idempotent (no-op if there's nothing to do), so safe to run on
     # every upgrade regardless of whether this particular one needs them.
-    # Both guarded on rc for the same reason as the maintenance-mode toggles
-    # elsewhere: docker_container_exec does not fail on a non-zero one, so an
-    # unguarded failure here finishes the upgrade green with migrations only
-    # half-applied. Both are idempotent, so the fix after a failure is simply
-    # to re-run - but only if you are told there was one.
+    # Unguarded, a failure here finishes the upgrade with migrations only
+    # half-applied. Both are idempotent, so recovery is just re-running -
+    # but only if you are told there was something to recover from.
     - name: Run expensive repairs (mimetype migrations, etc.)
       community.docker.docker_container_exec:
         container: nextcloud_app

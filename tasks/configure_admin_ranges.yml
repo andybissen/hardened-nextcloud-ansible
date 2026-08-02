@@ -18,10 +18,6 @@
 # afterward. allowed_admin_ranges is an allowlist, so a tail that briefly
 # outlives its replacement is more permissive than intended but still a
 # restriction - never the wide-open window a leading delete creates.
-#
-# Values are passed one plain token per occ call rather than as a single
-# --value='["a","b"]' JSON array: that would have to survive Ansible's
-# quoting, docker exec's argv handling, and the shell, for no gain.
 
 - name: Read the current admin IP range restriction
   community.docker.docker_container_exec:
@@ -55,11 +51,9 @@
     index_var: range_index
     label: "{{ item }}"
   register: admin_range_set
-  # docker_container_exec reports rc but does NOT fail the task on a non-zero
-  # one, so without this an occ that refused to run would leave the play green
-  # and the restriction silently unapplied - the exact failure mode this
-  # control must not have. Same reason the two tasks in playbook.yml wrap
-  # their occ calls in `until: rc == 0`.
+  # An occ that refused to run would otherwise leave the play green and the
+  # restriction silently unapplied - the one failure mode a security control
+  # must not have.
   failed_when: admin_range_set.rc != 0
   when:
     - nextcloud_allowed_admin_ranges is defined

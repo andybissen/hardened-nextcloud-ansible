@@ -159,6 +159,14 @@ control-machine copies, not whatever you sync off-site.
 | `fetch_backups_locally` | `true` | Pull each archive down to the control machine |
 | `backup_retention_count` | `8` | How many archives to keep (older ones pruned) |
 
+> **These paths are not namespaced per deployment.** If you point a second
+> instance at the same `remote_backup_dir`/`local_backup_dir`, both write
+> into one shared directory and `backup_retention_count` prunes across the
+> combined set — so a busy instance can age out the other's archives. An
+> archive's filename and location say nothing about which instance produced
+> it, so don't infer that when picking one to restore. Give each deployment
+> its own paths if you run more than one.
+
 ---
 
 ## Verify a backup
