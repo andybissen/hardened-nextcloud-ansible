@@ -145,6 +145,18 @@
           restoring - docker-compose.yml cannot be rendered without it.
       tags: [preflight]
 
+    # Mirrored for the same reason as the guard above. This playbook runs
+    # tasks/configure_admin_ranges.yml near the end, so without this the CIDR
+    # format check never happened on a restore at all - and a malformed range
+    # hides every admin action, landing during a disaster recovery, which is
+    # exactly the moment that include's own header warns about.
+    - name: Validate the optional admin IP range restriction
+      ansible.builtin.include_tasks:
+        file: tasks/assert_admin_ranges.yml
+        apply:
+          tags: [preflight]
+      tags: [preflight]
+
     - name: Create a local staging directory for the decrypted backup
       ansible.builtin.file:
         path: "/tmp/nextcloud-restore-{{ restore_timestamp }}"
@@ -252,6 +264,15 @@
 
     - name: Set up the host (Docker, firewalld, DOCKER-USER, journald)
       ansible.builtin.include_tasks: tasks/setup_host.yml
+
+    # Same reason as playbook.yml: handlers otherwise wait until end-of-play,
+    # so a Docker daemon that was already running without selinux-enabled
+    # would still be running under the old config when the restored stack is
+    # created below, leaving those containers unconfined until something
+    # recreates them. Especially worth getting right here - a restore target
+    # is often a replacement host somebody already had Docker on.
+    - name: Apply pending host changes before anything uses them
+      ansible.builtin.meta: flush_handlers
 
     # render_real_admin_password: a restore can never trigger a first install
     # - nc_data is restored before the stack comes up, so the entrypoint always

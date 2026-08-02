@@ -32,6 +32,18 @@
     - name: Set up the host (Docker, firewalld, DOCKER-USER, journald)
       ansible.builtin.include_tasks: tasks/setup_host.yml
 
+    # Handlers default to end-of-play, which is too late for the Docker
+    # restart that setup_host.yml notifies when it writes daemon.json. On a
+    # fresh host that is harmless - Docker's first start reads the new file -
+    # but on a host where the daemon was ALREADY running without
+    # selinux-enabled, the whole stack would be created below under the old
+    # config and only get SELinux confinement whenever containers next happen
+    # to be recreated. Labels are applied at creation, so a later daemon
+    # restart does not retrofit them. Flushing here also gets journald's
+    # retention active before container logs start flowing into it.
+    - name: Apply pending host changes before anything uses them
+      ansible.builtin.meta: flush_handlers
+
     # --- Vulnerability scan (informational only) ---
     # Skip with: ansible-playbook playbook.yml --ask-vault-pass --skip-tags scan
     # Worth skipping for a config-only re-run (e.g. tweaking z-apache-hardening.conf)
