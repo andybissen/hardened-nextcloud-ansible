@@ -195,6 +195,15 @@ vault password file instead:
 echo 'your-vault-pass' > ~/.nc-vault-pass && chmod 600 ~/.nc-vault-pass
 ```
 
+**Pick a time that clears Nextcloud's maintenance window.** The backup uses
+maintenance mode to get a consistent `pg_dump`/`nc_data.tar` pair, but a
+background job already mid-run keeps writing regardless — overlapping the
+window undercuts exactly the consistency that snapshot exists for. The window
+starts at `nextcloud_maintenance_window_start` (see `group_vars/all.yml.example`)
+and spans five hours, not the four upstream's docs claim. It's also in UTC and
+ignores DST, while the schedules below are local time and follow it, so leave
+margin in both halves of the year.
+
 ### systemd timer (recommended) — runs as your own user, no root/sudo
 
 **The working directory matters, not just cosmetically.** `ansible.cfg`

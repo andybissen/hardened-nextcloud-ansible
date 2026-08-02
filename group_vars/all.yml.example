@@ -69,9 +69,12 @@ nextcloud_cron_memory_limit: "512m"
 nextcloud_cron_cpus: "1.0"
 
 # Hour of the day (0-23, UTC, NOT your local time) that daily resource-heavy
-# background jobs (previews, file recognition, etc.) are allowed to start
-# in - Nextcloud runs them in a ~4 hour window from this hour. Pick
-# something that's late-night/early-morning in your users' actual timezone.
+# background jobs (previews, file recognition, etc.) are allowed to start in.
+# Nextcloud's docs call this a 4 hour window, but the end hour is inclusive
+# (core/Service/CronService.php compares `$currentHour > $startHour + 4`), so
+# it really spans five: 4 here means 04:00-09:00 UTC. Pick something that's
+# late-night/early-morning in your users' actual timezone, and keep it clear
+# of your backup schedule - see docs/backup.md.
 nextcloud_maintenance_window_start: 4
 
 # Postgres tuning - these should scale with postgres_memory_limit if you
