@@ -173,6 +173,10 @@
       community.docker.docker_container_exec:
         container: nextcloud_app
         command: php cron.php
+        # cron.php refuses to run as anyone but the owner of config.php; a
+        # bare exec is root, so all three passes failed after a live
+        # upgrade. (occ tolerates root, cron.php doesn't.)
+        user: www-data
       loop: "{{ range(1, 4) | list }}"
       loop_control:
         label: "pass {{ item }}"
