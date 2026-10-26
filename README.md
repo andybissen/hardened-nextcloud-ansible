@@ -9,7 +9,7 @@ reaches the Docker API only through a locked-down read-only socket proxy.
 Highlights:
 
 - **Hardened TLS** — TLS 1.3 with post-quantum hybrid key exchange
-  (`X25519MLKEM768`), a minimal modern TLS 1.2 fallback, ECDSA P-384 certs,
+  (`X25519MLKEM768`) as the minimum version, ECDSA P-384 certs,
   HSTS preload, and `sniStrict` (raw-IP probes get nothing).
 - **Secrets kept out of the config** — file-based Docker secrets + Ansible
   Vault; no passwords in the compose file, container environments, or

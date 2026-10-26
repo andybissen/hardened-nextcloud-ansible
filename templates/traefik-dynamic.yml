@@ -8,7 +8,7 @@ tls:
     # The special name "default" applies to every TLS connection Traefik
     # terminates, with no per-router opt-in needed.
     default:
-      minVersion: VersionTLS12
+      minVersion: VersionTLS13
       # Reject clients that don't send SNI - they can't be matched to a
       # router anyway, and scanners probing the bare IP get dropped at the
       # handshake instead of receiving a default certificate.

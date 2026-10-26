@@ -21,8 +21,8 @@ Every playbook is encrypted-vault–aware and must be run with
 ## The stack at a glance
 
 - **Traefik** — TLS termination, automatic Let's Encrypt certs (ECDSA
-  P-384), HTTP→HTTPS redirect, modern TLS policy (TLS 1.3 with
-  post-quantum key exchange, restricted TLS 1.2 fallback).
+  P-384), HTTP→HTTPS redirect, modern TLS policy (TLS 1.3 only,
+  with post-quantum key exchange).
 - **socket-proxy** — read-only broker in front of the Docker socket so
   Traefik never touches `docker.sock` directly.
 - **Postgres** — the database. Data in a named volume; not reachable off-host.
