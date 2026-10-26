@@ -33,6 +33,7 @@
     src: templates/traefik-dynamic.yml
     dest: "{{ compose_dir }}/traefik/dynamic.yml"
     mode: "0640"
+  notify: Restart Traefik
 
 - name: Create a postgres/ subdirectory for Postgres-specific config
   ansible.builtin.file:

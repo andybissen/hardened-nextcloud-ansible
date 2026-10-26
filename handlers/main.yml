@@ -17,3 +17,17 @@
   ansible.builtin.systemd:
     name: systemd-journald
     state: restarted
+
+# Traefik's dynamic.yml is bind-mounted as a single file, and the copy task
+# replaces it via temp file + rename(), giving the host path a new inode
+# while the running container keeps reading the old one - so an edit (TLS
+# options, middlewares) is silently ignored until the container restarts.
+# Confirmed live: after dropping TLS 1.2, a green play still negotiated 1.2.
+# Runs at end of play, after "Bring up the stack", so it also covers a
+# first install (a harmless extra restart of a just-created container).
+- name: Restart Traefik
+  community.docker.docker_compose_v2:
+    project_src: "{{ compose_dir }}"
+    services:
+      - traefik
+    state: restarted
