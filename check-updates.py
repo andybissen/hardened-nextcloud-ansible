@@ -85,6 +85,10 @@ EOL_WARN_DAYS = 90
 # here uses this same "<prefix><numbers><suffix>" shape for real release
 # tags, which is what makes one shared parser workable.
 #
+# release_parts is how many numeric components a REAL release tag has for
+# this repo (Traefik "v3.7.17" = 3, Postgres "18.6-trixie" = 2); shorter tags
+# are floating aliases and are ignored when looking for the newest release.
+#
 # eol_slug is OPTIONAL: omit it for a project endoflife.date doesn't track,
 # and the EOL row is skipped for that image.
 #
@@ -101,6 +105,7 @@ IMAGES = [
         "var": "traefik_image",
         "hub_repo": "library/traefik",
         "prefix": "v",
+        "release_parts": 3,
         "suffix": "",
         "eol_slug": "traefik",
         "deployed_task": "check traefik version",
@@ -124,6 +129,7 @@ IMAGES = [
         "var": "socket_proxy_image",
         "hub_repo": "tecnativa/docker-socket-proxy",
         "prefix": "v",
+        "release_parts": 3,
         "suffix": "",
         "deployed_task": "check socket-proxy version",
         "deployed_regex": r'org\.opencontainers\.image\.version":\s*"v?([\d.]+)"',
@@ -133,6 +139,7 @@ IMAGES = [
         "var": "postgres_image",
         "hub_repo": "library/postgres",
         "prefix": "",
+        "release_parts": 2,
         "suffix": "-trixie",
         "eol_slug": "postgresql",
         "deployed_task": "check postgres version",
@@ -143,6 +150,7 @@ IMAGES = [
         "var": "nextcloud_image",
         "hub_repo": "library/nextcloud",
         "prefix": "",
+        "release_parts": 3,
         "suffix": "-apache",
         "eol_slug": "nextcloud",
         "deployed_task": "check nextcloud version",
@@ -153,6 +161,7 @@ IMAGES = [
         "var": "valkey_image",
         "hub_repo": "valkey/valkey",
         "prefix": "",
+        "release_parts": 3,
         "suffix": "-alpine",
         "eol_slug": "valkey",
         "deployed_task": "check valkey version",
@@ -169,13 +178,20 @@ def read_pin(var_name):
     return m.group(1).split(":", 1)[1]  # "traefik:v3.7" -> "v3.7"
 
 
-def parse_version(tag: str, prefix: str, suffix: str) -> tuple[int, ...] | None:
+def parse_version(tag: str, prefix: str, suffix: str, parts: int = 1) -> tuple[int, ...] | None:
     """Return a tuple of ints for a real release tag, or None if this tag
-    isn't one (pre-releases, platform variants, floating aliases, etc.)."""
+    isn't one (pre-releases, platform variants, floating aliases, etc.).
+
+    parts is the minimum component count: Docker Hub's floating aliases
+    ("9.2-alpine", "9-alpine") look like shorter releases and would
+    otherwise win max() over the real newest tag. Left at 1 for parsing the
+    pin itself, which is deliberately shorter than a full release tag."""
     if not tag.startswith(prefix) or not tag.endswith(suffix):
         return None
     middle = tag[len(prefix): len(tag) - len(suffix) if suffix else len(tag)]
     if not re.fullmatch(r"\d+(\.\d+){0,2}", middle):
+        return None
+    if middle.count(".") + 1 < parts:
         return None
     return tuple(int(p) for p in middle.split("."))
 
@@ -215,7 +231,7 @@ def fetch_tags_matching(image: dict, name_filter: str) -> dict[tuple[int, ...], 
             print(f"  ! could not reach Docker Hub ({name_filter}): {e}")
             break
         for result in data.get("results", []):
-            v = parse_version(result["name"], image["prefix"], image["suffix"])
+            v = parse_version(result["name"], image["prefix"], image["suffix"], image["release_parts"])
             if v:
                 versions[v] = result.get("last_updated", "")[:10]
         url = data.get("next")
