@@ -195,6 +195,11 @@ vault password file instead:
 echo 'your-vault-pass' > ~/.nc-vault-pass && chmod 600 ~/.nc-vault-pass
 ```
 
+Instead of a plaintext file, `--vault-password-file` also accepts an executable
+that prints the password to stdout (e.g. a wrapper around `keepassxc-cli show`
+with a YubiKey) — point the flag at the script instead. A touch-required key
+can't serve an unattended run, so use a key that doesn't need one for the timer.
+
 **Pick a time that clears Nextcloud's maintenance window.** The backup uses
 maintenance mode to get a consistent `pg_dump`/`nc_data.tar` pair, but a
 background job already mid-run keeps writing regardless — overlapping the

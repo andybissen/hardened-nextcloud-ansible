@@ -164,10 +164,16 @@ Run `ansible-lint` before finalizing any change to a playbook, task file, or
 template:
 
 ```bash
-ANSIBLE_VAULT_PASSWORD_FILE=~/.nc-vault-pass ansible-lint .
+ANSIBLE_VAULT_PASSWORD_FILE=~/.local/bin/nc-vault-pass ansible-lint .
 ```
 
-The vault password file is needed because five playbooks load the encrypted
+`nc-vault-pass` is an executable wrapper around `keepassxc-cli` that needs the
+YubiKey plugged in (no touch required). It `flock`s because lint runs the five
+syntax-checks in parallel and the key serves one request at a time — without
+it the parallel calls fail with "Could not find hardware key". If the key
+isn't present, treat it as the no-password case below.
+
+The vault password is needed because five playbooks load the encrypted
 `group_vars/vault.yml` via `vars_files`; without it those five fail their
 syntax-check step with a decrypt error instead of being linted (see
 `.ansible-lint`'s comment). No vault password available in your context (an
